@@ -33,6 +33,7 @@ target_include_directories(RtxVideoBridge SYSTEM PRIVATE
 target_link_libraries(RtxVideoBridge PRIVATE
     "${RTX_VIDEO_SDK_DIR}/lib/Windows/x64/nvsdk_ngx_s.lib"
     d3d11
+    d3dcompiler
     dxgi
     user32
     shell32

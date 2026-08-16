@@ -3,6 +3,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using SysDVR.Client.Core;
+using static SDL2.SDL;
 
 namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
 {
@@ -103,6 +104,56 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
         public double EvaluateGpuMilliseconds;
         public double ReadbackCopyGpuMilliseconds;
         public double TotalGpuMilliseconds;
+        public double DirectDrawSubmitCpuMilliseconds;
+        public double DirectDrawGpuMilliseconds;
+        public double CpuBlockingWaitMilliseconds;
+        public uint DirectMode;
+        public uint GpuTimingLatencyFrames;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+    internal unsafe struct RtxVideoD3D11DeviceInfo
+    {
+        public const int AdapterNameBytes = 128;
+
+        public uint StructSize;
+        public uint AdapterIndex;
+        public uint AdapterVendorId;
+        public uint AdapterDeviceId;
+        public ulong AdapterDedicatedVideoMemory;
+        public int AdapterLuidHigh;
+        public uint AdapterLuidLow;
+        public uint FeatureLevel;
+        public fixed byte AdapterNameUtf8[AdapterNameBytes];
+
+        public string AdapterName
+        {
+            get
+            {
+                fixed (byte* name = AdapterNameUtf8)
+                {
+                    int length = 0;
+                    while (length < AdapterNameBytes && name[length] != 0)
+                        ++length;
+                    return Encoding.UTF8.GetString(name, length);
+                }
+            }
+        }
+
+        public string Luid => $"{AdapterLuidHigh:X8}:{AdapterLuidLow:X8}";
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct RtxVideoDirectRenderOptions
+    {
+        public uint StructSize;
+        public float DestinationX;
+        public float DestinationY;
+        public float DestinationWidth;
+        public float DestinationHeight;
+        public uint TargetWidth;
+        public uint TargetHeight;
+        public uint RotationQuarterTurns;
     }
 
     internal readonly record struct RtxVideoOutputSize(uint Width, uint Height)
@@ -165,12 +216,13 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
 
     internal sealed unsafe class RtxVideoNative : IDisposable
     {
-        public const uint ApiVersion = 2;
+        public const uint ApiVersion = 3;
         public const uint InputWidth = 1280;
         public const uint InputHeight = 720;
 
         public uint OutputWidth { get; private set; }
         public uint OutputHeight { get; private set; }
+        public bool IsGpuDirect { get; private set; }
 
         private nint _library;
         private nint _handle;
@@ -179,7 +231,12 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
         private readonly delegate* unmanaged[Cdecl]<uint> _getApiVersion;
         private readonly delegate* unmanaged[Cdecl]<RtxVideoProbeOptions*, RtxVideoCapabilities*, RtxVideoStatus> _probe;
         private readonly delegate* unmanaged[Cdecl]<RtxVideoCreateOptions*, nint*, RtxVideoStatus> _create;
+        private readonly delegate* unmanaged[Cdecl]<RtxVideoCreateOptions*, nint, nint*, RtxVideoStatus> _createWithD3D11Device;
+        private readonly delegate* unmanaged[Cdecl]<nint, RtxVideoD3D11DeviceInfo*, RtxVideoStatus> _getD3D11DeviceInfo;
         private readonly delegate* unmanaged[Cdecl]<nint, void*, uint, void*, uint, RtxVideoStatus> _process;
+        private readonly delegate* unmanaged[Cdecl]<nint, void*, uint, RtxVideoStatus> _processGpu;
+        private readonly delegate* unmanaged[Cdecl]<nint, RtxVideoDirectRenderOptions*, RtxVideoStatus> _renderOutputD3D11;
+        private readonly delegate* unmanaged[Cdecl]<nint, void*, uint, RtxVideoStatus> _readbackOutput;
         private readonly delegate* unmanaged[Cdecl]<nint, uint, uint, uint, RtxVideoStatus> _reconfigure;
         private readonly delegate* unmanaged[Cdecl]<nint, RtxVideoNativeFrameTiming*, RtxVideoStatus> _getLastFrameTiming;
         private readonly delegate* unmanaged[Cdecl]<nint, byte*, nuint*, RtxVideoStatus> _getLastError;
@@ -208,7 +265,12 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
                 _getApiVersion = (delegate* unmanaged[Cdecl]<uint>)GetExport("rvb_get_api_version");
                 _probe = (delegate* unmanaged[Cdecl]<RtxVideoProbeOptions*, RtxVideoCapabilities*, RtxVideoStatus>)GetExport("rvb_probe");
                 _create = (delegate* unmanaged[Cdecl]<RtxVideoCreateOptions*, nint*, RtxVideoStatus>)GetExport("rvb_create");
+                _createWithD3D11Device = (delegate* unmanaged[Cdecl]<RtxVideoCreateOptions*, nint, nint*, RtxVideoStatus>)GetExport("rvb_create_with_d3d11_device");
+                _getD3D11DeviceInfo = (delegate* unmanaged[Cdecl]<nint, RtxVideoD3D11DeviceInfo*, RtxVideoStatus>)GetExport("rvb_get_d3d11_device_info");
                 _process = (delegate* unmanaged[Cdecl]<nint, void*, uint, void*, uint, RtxVideoStatus>)GetExport("rvb_process_rgba8");
+                _processGpu = (delegate* unmanaged[Cdecl]<nint, void*, uint, RtxVideoStatus>)GetExport("rvb_process_rgba8_gpu");
+                _renderOutputD3D11 = (delegate* unmanaged[Cdecl]<nint, RtxVideoDirectRenderOptions*, RtxVideoStatus>)GetExport("rvb_render_output_d3d11");
+                _readbackOutput = (delegate* unmanaged[Cdecl]<nint, void*, uint, RtxVideoStatus>)GetExport("rvb_readback_output_rgba8");
                 _reconfigure = (delegate* unmanaged[Cdecl]<nint, uint, uint, uint, RtxVideoStatus>)GetExport("rvb_reconfigure");
                 _getLastFrameTiming = (delegate* unmanaged[Cdecl]<nint, RtxVideoNativeFrameTiming*, RtxVideoStatus>)GetExport("rvb_get_last_frame_timing");
                 _getLastError = (delegate* unmanaged[Cdecl]<nint, byte*, nuint*, RtxVideoStatus>)GetExport("rvb_get_last_error");
@@ -275,7 +337,8 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
 
         public void Create(
             RtxVideoQuality quality,
-            RtxVideoOutputResolution outputResolution)
+            RtxVideoOutputResolution outputResolution,
+            nint externalD3D11Device = 0)
         {
             ThrowIfDisposed();
             if (_handle != 0)
@@ -303,9 +366,17 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
                 };
 
                 nint handle = 0;
-                RtxVideoStatus status = _create(&options, &handle);
+                RtxVideoStatus status = externalD3D11Device == 0
+                    ? _create(&options, &handle)
+                    : _createWithD3D11Device(
+                        &options, externalD3D11Device, &handle);
                 if (status != RtxVideoStatus.Ok)
-                    ThrowOnFailure(status, 0, "RTX VSR feature creation");
+                    ThrowOnFailure(
+                        status,
+                        0,
+                        externalD3D11Device == 0
+                            ? "RTX VSR feature creation"
+                            : "RTX VSR feature creation on the SDL D3D11 device");
                 if (handle == 0)
                 {
                     throw new RtxVideoException(
@@ -315,7 +386,20 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
                 _handle = handle;
                 OutputWidth = outputSize.Width;
                 OutputHeight = outputSize.Height;
+                IsGpuDirect = externalD3D11Device != 0;
             }
+        }
+
+        public RtxVideoD3D11DeviceInfo GetD3D11DeviceInfo(nint device)
+        {
+            ThrowIfDisposed();
+            RtxVideoD3D11DeviceInfo info = new()
+            {
+                StructSize = (uint)sizeof(RtxVideoD3D11DeviceInfo),
+            };
+            RtxVideoStatus status = _getD3D11DeviceInfo(device, &info);
+            ThrowOnFailure(status, 0, "SDL D3D11 adapter inspection");
+            return info;
         }
 
         public void Reconfigure(
@@ -347,6 +431,50 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
                 StructSize = (uint)sizeof(RtxVideoNativeFrameTiming),
             };
             status = _getLastFrameTiming(_handle, &timing);
+            ThrowOnFailure(status, _handle, "RTX VSR timing retrieval");
+            return timing;
+        }
+
+        public RtxVideoNativeFrameTiming ProcessGpu(void* input, uint inputStride)
+        {
+            ThrowIfNotCreated();
+            if (!IsGpuDirect)
+                throw new InvalidOperationException("The RTX Video bridge is not in GPU-direct mode.");
+
+            RtxVideoStatus status = _processGpu(_handle, input, inputStride);
+            ThrowOnFailure(status, _handle, "GPU-direct RTX VSR frame processing");
+            return GetLastFrameTiming();
+        }
+
+        public RtxVideoNativeFrameTiming RenderOutputD3D11(
+            in RtxVideoDirectRenderOptions renderOptions)
+        {
+            ThrowIfNotCreated();
+            if (!IsGpuDirect)
+                throw new InvalidOperationException("The RTX Video bridge is not in GPU-direct mode.");
+
+            RtxVideoDirectRenderOptions options = renderOptions;
+            options.StructSize = (uint)sizeof(RtxVideoDirectRenderOptions);
+            RtxVideoStatus status = _renderOutputD3D11(_handle, &options);
+            ThrowOnFailure(status, _handle, "GPU-direct RTX VSR presentation");
+            return GetLastFrameTiming();
+        }
+
+        public void ReadbackOutput(void* output, uint outputStride)
+        {
+            ThrowIfNotCreated();
+            RtxVideoStatus status = _readbackOutput(
+                _handle, output, outputStride);
+            ThrowOnFailure(status, _handle, "Explicit RTX VSR screenshot readback");
+        }
+
+        private RtxVideoNativeFrameTiming GetLastFrameTiming()
+        {
+            RtxVideoNativeFrameTiming timing = new()
+            {
+                StructSize = (uint)sizeof(RtxVideoNativeFrameTiming),
+            };
+            RtxVideoStatus status = _getLastFrameTiming(_handle, &timing);
             ThrowOnFailure(status, _handle, "RTX VSR timing retrieval");
             return timing;
         }
@@ -461,7 +589,9 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
 
         public static RtxVideoNative? CreateForStream(
             RtxVideoQuality quality,
-            RtxVideoOutputResolution outputResolution)
+            RtxVideoOutputResolution outputResolution,
+            RtxVideoPresentationBackend presentationBackend,
+            nint sdlRenderer)
         {
             lock (StateLock)
             {
@@ -473,9 +603,49 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
             try
             {
                 bridge = new RtxVideoNative();
-                bridge.Create(quality, outputResolution);
+                if (presentationBackend ==
+                    RtxVideoPresentationBackend.GpuDirectExperimental)
+                {
+                    nint d3d11Device = SDL_RenderGetD3D11Device(sdlRenderer);
+                    if (d3d11Device == 0)
+                    {
+                        throw new RtxVideoException(
+                            RtxVideoStatus.D3dFailed,
+                            $"SDL_RenderGetD3D11Device failed: {SDL_GetError()}");
+                    }
+
+                    try
+                    {
+                        RtxVideoCapabilities expected = bridge.Probe();
+                        RtxVideoD3D11DeviceInfo actual =
+                            bridge.GetD3D11DeviceInfo(d3d11Device);
+                        Console.WriteLine(
+                            $"[RTX VSR] SDL D3D11 device: '{actual.AdapterName}', " +
+                            $"DXGI adapter {actual.AdapterIndex}, vendor 0x{actual.AdapterVendorId:X4}, " +
+                            $"device 0x{actual.AdapterDeviceId:X4}, LUID {actual.Luid}, " +
+                            $"feature level 0x{actual.FeatureLevel:X}; " +
+                            $"NGX probe LUID {expected.AdapterLuidHigh:X8}:{expected.AdapterLuidLow:X8}.");
+                        if (actual.AdapterLuidHigh != expected.AdapterLuidHigh ||
+                            actual.AdapterLuidLow != expected.AdapterLuidLow)
+                        {
+                            throw new RtxVideoException(
+                                RtxVideoStatus.WrongAdapter,
+                                "SDL and the NVIDIA RTX VSR probe selected different DXGI adapter LUIDs.");
+                        }
+                        bridge.Create(quality, outputResolution, d3d11Device);
+                    }
+                    finally
+                    {
+                        // SDL_RenderGetD3D11Device returns an AddRef'd interface.
+                        Marshal.Release(d3d11Device);
+                    }
+                }
+                else
+                {
+                    bridge.Create(quality, outputResolution);
+                }
                 string message =
-                    $"Initialized for live processing at {quality}, " +
+                    $"Initialized {presentationBackend} live processing at {quality}, " +
                     $"{bridge.OutputWidth}x{bridge.OutputHeight}";
                 MarkReady(message);
                 Console.WriteLine($"[RTX VSR] {message}; feature path: {RtxVideoPaths.FeatureDirectory}");
@@ -484,9 +654,28 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
             catch (Exception error)
             {
                 bridge?.Dispose();
-                DisableForSession(error.Message);
+                if (presentationBackend ==
+                    RtxVideoPresentationBackend.GpuDirectExperimental)
+                {
+                    MarkReady($"GPU direct unavailable; falling back: {error.Message}");
+                    Console.WriteLine(
+                        $"[RTX VSR] GPU-direct initialization failed: {error.Message}. " +
+                        "Trying the supported CPU-readback path.");
+                }
+                else
+                {
+                    DisableForSession(error.Message);
+                }
                 return null;
             }
+        }
+
+        public static void ReportDirectFailure(string reason)
+        {
+            MarkReady($"GPU direct failed; CPU-readback fallback available: {reason}");
+            Console.WriteLine(
+                $"[RTX VSR] GPU-direct path stopped: {reason}. " +
+                "No additional frame buffering was introduced.");
         }
 
         public static void DisableForSession(string reason)

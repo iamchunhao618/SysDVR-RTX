@@ -42,12 +42,20 @@ namespace SysDVR.Client.Core
         UltraHd2160p = 2160,
     }
 
+    public enum RtxVideoPresentationBackend
+    {
+        CpuReadback = 0,
+        GpuDirectExperimental = 1,
+    }
+
     public class RtxVideoOptions
     {
         public bool Enabled = false;
         public RtxVideoOutputResolution OutputResolution =
             RtxVideoOutputResolution.QuadHd1440p;
         public RtxVideoQuality Quality = RtxVideoQuality.Medium;
+        public RtxVideoPresentationBackend PresentationBackend =
+            RtxVideoPresentationBackend.CpuReadback;
     }
 
     public class Options

@@ -205,6 +205,9 @@ namespace SysDVR.Client.Core
 			public string RtxVideoQualityMedium = "Medium";
 			public string RtxVideoQualityHigh = "High";
 			public string RtxVideoQualityUltra = "Ultra";
+			public string RtxVideoPresentationBackend = "RTX VSR presentation path";
+			public string RtxVideoBackendCpu = "CPU readback (compatible)";
+			public string RtxVideoBackendGpu = "GPU direct (experimental, restart required)";
 			public string RtxVideoOutput = "The NVIDIA RTX Video SDK directly produces the selected output size.";
 			public string RtxVideoStatus = "RTX VSR status: {0}";
 			

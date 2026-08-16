@@ -24,6 +24,10 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
         public int OutputHeight { get; }
         public int OutputStride { get; }
         public RtxVideoOutputResolution OutputResolution { get; }
+        public RtxVideoPresentationBackend PresentationBackend { get; }
+        public bool IsGpuDirect =>
+            PresentationBackend == RtxVideoPresentationBackend.GpuDirectExperimental;
+        public string? FailureReason { get; private set; }
 
         private readonly byte*[] _sourcePlanes = new byte*[8];
         private readonly int[] _sourceStrides = new int[8];
@@ -45,11 +49,13 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
         private RtxVideoEnhancer(
             RtxVideoNative bridge,
             RtxVideoQuality quality,
-            RtxVideoOutputResolution outputResolution)
+            RtxVideoOutputResolution outputResolution,
+            RtxVideoPresentationBackend presentationBackend)
         {
             _bridge = bridge;
             _quality = quality;
             OutputResolution = outputResolution;
+            PresentationBackend = presentationBackend;
             OutputWidth = checked((int)bridge.OutputWidth);
             OutputHeight = checked((int)bridge.OutputHeight);
             OutputStride = checked(OutputWidth * 4);
@@ -58,9 +64,12 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
             {
                 _inputBuffer = (byte*)NativeMemory.AlignedAlloc(
                     (nuint)(InputStride * InputHeight), 32);
-                _outputBuffer = (byte*)NativeMemory.AlignedAlloc(
-                    (nuint)(OutputStride * OutputHeight), 32);
-                if (_inputBuffer == null || _outputBuffer == null)
+                if (!IsGpuDirect)
+                {
+                    _outputBuffer = (byte*)NativeMemory.AlignedAlloc(
+                        (nuint)(OutputStride * OutputHeight), 32);
+                }
+                if (_inputBuffer == null || (!IsGpuDirect && _outputBuffer == null))
                     throw new OutOfMemoryException("Could not allocate RTX Video RGBA frame buffers.");
 
                 _converter = sws_getContext(
@@ -82,22 +91,29 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
 
         public static RtxVideoEnhancer? TryCreate(
             RtxVideoQuality quality,
-            RtxVideoOutputResolution outputResolution)
+            RtxVideoOutputResolution outputResolution,
+            RtxVideoPresentationBackend presentationBackend,
+            nint sdlRenderer)
         {
             RtxVideoNative? bridge = RtxVideoSupport.CreateForStream(
-                quality, outputResolution);
+                quality, outputResolution, presentationBackend, sdlRenderer);
             if (bridge is null)
                 return null;
 
             try
             {
-                return new RtxVideoEnhancer(bridge, quality, outputResolution);
+                return new RtxVideoEnhancer(
+                    bridge, quality, outputResolution, presentationBackend);
             }
             catch (Exception error)
             {
                 bridge.Dispose();
-                RtxVideoSupport.DisableForSession(
-                    $"YUV420P to RGBA converter initialization failed: {error.Message}");
+                if (presentationBackend ==
+                    RtxVideoPresentationBackend.GpuDirectExperimental)
+                    RtxVideoSupport.ReportDirectFailure(error.Message);
+                else
+                    RtxVideoSupport.DisableForSession(
+                        $"YUV420P to RGBA converter initialization failed: {error.Message}");
                 return null;
             }
         }
@@ -146,9 +162,11 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
                 }
 
                 long bridgeStart = Stopwatch.GetTimestamp();
-                RtxVideoNativeFrameTiming nativeTiming = _bridge.Process(
-                    _inputBuffer, InputStride, _outputBuffer,
-                    checked((uint)OutputStride));
+                RtxVideoNativeFrameTiming nativeTiming = IsGpuDirect
+                    ? _bridge.ProcessGpu(_inputBuffer, InputStride)
+                    : _bridge.Process(
+                        _inputBuffer, InputStride, _outputBuffer,
+                        checked((uint)OutputStride));
                 double bridgeMilliseconds = Stopwatch.GetElapsedTime(
                     bridgeStart).TotalMilliseconds;
 
@@ -160,12 +178,59 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
             }
             catch (Exception error)
             {
-                _failed = true;
-                _bridge.Dispose();
-                _bridge = null;
-                RtxVideoSupport.DisableForSession(error.Message);
+                Fail(error);
                 return false;
             }
+        }
+
+        public bool TryRenderGpuDirect(
+            in RtxVideoDirectRenderOptions options,
+            out RtxVideoNativeFrameTiming timing)
+        {
+            timing = default;
+            if (!IsGpuDirect || _disposed || _failed || _bridge is null)
+                return false;
+
+            try
+            {
+                timing = _bridge.RenderOutputD3D11(options);
+                return true;
+            }
+            catch (Exception error)
+            {
+                Fail(error);
+                return false;
+            }
+        }
+
+        public nint ReadbackForScreenshot()
+        {
+            if (_disposed || _failed || _bridge is null)
+                throw new InvalidOperationException(
+                    "RTX VSR output is unavailable for screenshot capture.");
+            if (_outputBuffer == null)
+            {
+                _outputBuffer = (byte*)NativeMemory.AlignedAlloc(
+                    (nuint)(OutputStride * OutputHeight), 32);
+                if (_outputBuffer == null)
+                    throw new OutOfMemoryException(
+                        "Could not allocate the explicit RTX VSR screenshot buffer.");
+            }
+            if (IsGpuDirect)
+                _bridge.ReadbackOutput(_outputBuffer, checked((uint)OutputStride));
+            return (nint)_outputBuffer;
+        }
+
+        private void Fail(Exception error)
+        {
+            FailureReason = error.Message;
+            _failed = true;
+            _bridge?.Dispose();
+            _bridge = null;
+            if (IsGpuDirect)
+                RtxVideoSupport.ReportDirectFailure(error.Message);
+            else
+                RtxVideoSupport.DisableForSession(error.Message);
         }
 
         private static void ValidateFrame(AVFrame* frame)
@@ -290,50 +355,171 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
 
     internal sealed class RtxVideoTelemetry
     {
+        private const int WarmupFrames = 20;
         private const int ReportingInterval = 120;
 
+        private sealed class PendingFrame
+        {
+            public required RtxVideoQuality Quality { get; init; }
+            public required RtxVideoOutputResolution Resolution { get; init; }
+            public required RtxVideoFrameTiming Timing { get; set; }
+            public required double DecodeReceiveMilliseconds { get; init; }
+            public required double SdlUploadMilliseconds { get; init; }
+            public required double EnhancementMilliseconds { get; set; }
+            public required long FrameAvailableTimestamp { get; init; }
+            public double VideoSubmitMilliseconds { get; set; } = double.NaN;
+        }
+
+        private readonly List<double> _decodeReceive = new(ReportingInterval);
         private readonly List<double> _conversion = new(ReportingInterval);
+        private readonly List<double> _bridgeHost = new(ReportingInterval);
+        private readonly List<double> _uploadSubmitCpu = new(ReportingInterval);
+        private readonly List<double> _uploadGpu = new(ReportingInterval);
+        private readonly List<double> _evaluateCallCpu = new(ReportingInterval);
         private readonly List<double> _nativeProcess = new(ReportingInterval);
         private readonly List<double> _vsrGpu = new(ReportingInterval);
+        private readonly List<double> _copySubmitCpu = new(ReportingInterval);
+        private readonly List<double> _copyGpu = new(ReportingInterval);
+        private readonly List<double> _totalGpu = new(ReportingInterval);
         private readonly List<double> _readback = new(ReportingInterval);
         private readonly List<double> _mapWait = new(ReportingInterval);
         private readonly List<double> _rowCopy = new(ReportingInterval);
+        private readonly List<double> _queryResolve = new(ReportingInterval);
+        private readonly List<double> _directDrawSubmitCpu = new(ReportingInterval);
+        private readonly List<double> _directDrawGpu = new(ReportingInterval);
+        private readonly List<double> _cpuBlockingWait = new(ReportingInterval);
+        private readonly List<double> _gpuTimingLatencyFrames = new(ReportingInterval);
         private readonly List<double> _sdlUpload = new(ReportingInterval);
-        private readonly List<double> _total = new(ReportingInterval);
+        private readonly List<double> _enhancement = new(ReportingInterval);
+        private readonly List<double> _videoSubmit = new(ReportingInterval);
+        private readonly List<double> _uiBuild = new(ReportingInterval);
+        private readonly List<double> _uiSubmit = new(ReportingInterval);
+        private readonly List<double> _present = new(ReportingInterval);
+        private readonly List<double> _decodedToPresent = new(ReportingInterval);
+        private readonly List<double> _frameInterval = new(ReportingInterval);
         private RtxVideoQuality? _activeQuality;
         private RtxVideoOutputResolution? _activeResolution;
+        private PendingFrame? _pending;
+        private long _lastPresentedTimestamp;
+        private int _warmupRemaining;
 
-        public void Record(
+        public void BeginFrame(
             RtxVideoQuality quality,
             RtxVideoOutputResolution resolution,
             RtxVideoFrameTiming frame,
-            double uploadMilliseconds,
-            double pathMilliseconds)
+            double decodeReceiveMilliseconds,
+            double sdlUploadMilliseconds,
+            double enhancementMilliseconds,
+            long frameAvailableTimestamp)
         {
-            if (_activeQuality.HasValue &&
-                (_activeQuality.Value != quality || _activeResolution != resolution))
+            bool configurationChanged = !_activeQuality.HasValue ||
+                _activeQuality.Value != quality ||
+                _activeResolution != resolution;
+            if (configurationChanged)
             {
-                Log(_activeQuality.Value, _activeResolution!.Value, true);
+                if (_activeQuality.HasValue && _conversion.Count != 0)
+                    Log(_activeQuality.Value, _activeResolution!.Value, true);
                 ResetSamples();
+                _warmupRemaining = WarmupFrames;
             }
             _activeQuality = quality;
             _activeResolution = resolution;
 
-            _conversion.Add(frame.ConversionMilliseconds);
-            _nativeProcess.Add(frame.Native.ProcessCpuMilliseconds);
-            _vsrGpu.Add(
-                frame.Native.GpuTimingValid != 0
-                    ? frame.Native.EvaluateGpuMilliseconds
-                    : double.NaN);
-            _readback.Add(frame.Native.ReadbackCpuMilliseconds);
-            _mapWait.Add(frame.Native.MapWaitCpuMilliseconds);
-            _rowCopy.Add(frame.Native.RowCopyCpuMilliseconds);
-            _sdlUpload.Add(uploadMilliseconds);
-            _total.Add(pathMilliseconds);
+            _pending = new PendingFrame
+            {
+                Quality = quality,
+                Resolution = resolution,
+                Timing = frame,
+                DecodeReceiveMilliseconds = decodeReceiveMilliseconds,
+                SdlUploadMilliseconds = sdlUploadMilliseconds,
+                EnhancementMilliseconds = enhancementMilliseconds,
+                FrameAvailableTimestamp = frameAvailableTimestamp,
+            };
+        }
+
+        public void RecordVideoSubmission(
+            double milliseconds,
+            RtxVideoNativeFrameTiming? updatedNativeTiming = null,
+            double? enhancementMilliseconds = null)
+        {
+            if (_pending is not null)
+            {
+                _pending.VideoSubmitMilliseconds = milliseconds;
+                if (updatedNativeTiming.HasValue)
+                {
+                    _pending.Timing = _pending.Timing with
+                    {
+                        Native = updatedNativeTiming.Value,
+                    };
+                }
+                if (enhancementMilliseconds.HasValue)
+                    _pending.EnhancementMilliseconds = enhancementMilliseconds.Value;
+            }
+        }
+
+        public void CompleteFrame(
+            double uiBuildMilliseconds,
+            double uiSubmitMilliseconds,
+            double presentMilliseconds)
+        {
+            PendingFrame? pending = _pending;
+            if (pending is null)
+                return;
+            _pending = null;
+
+            long presentedTimestamp = Stopwatch.GetTimestamp();
+            if (_warmupRemaining != 0)
+            {
+                --_warmupRemaining;
+                _lastPresentedTimestamp = 0;
+                return;
+            }
+
+            RtxVideoNativeFrameTiming native = pending.Timing.Native;
+            bool gpuTimingValid = native.GpuTimingValid != 0;
+
+            _decodeReceive.Add(pending.DecodeReceiveMilliseconds);
+            _conversion.Add(pending.Timing.ConversionMilliseconds);
+            _bridgeHost.Add(pending.Timing.BridgeMilliseconds);
+            _uploadSubmitCpu.Add(native.UploadSubmitCpuMilliseconds);
+            _uploadGpu.Add(gpuTimingValid ? native.UploadGpuMilliseconds : double.NaN);
+            _evaluateCallCpu.Add(native.EvaluateCallCpuMilliseconds);
+            _vsrGpu.Add(gpuTimingValid ? native.EvaluateGpuMilliseconds : double.NaN);
+            _copySubmitCpu.Add(native.CopySubmitCpuMilliseconds);
+            _copyGpu.Add(gpuTimingValid ? native.ReadbackCopyGpuMilliseconds : double.NaN);
+            _totalGpu.Add(gpuTimingValid ? native.TotalGpuMilliseconds : double.NaN);
+            _nativeProcess.Add(native.ProcessCpuMilliseconds);
+            _readback.Add(native.ReadbackCpuMilliseconds);
+            _mapWait.Add(native.MapWaitCpuMilliseconds);
+            _rowCopy.Add(native.RowCopyCpuMilliseconds);
+            _queryResolve.Add(native.QueryResolveCpuMilliseconds);
+            _directDrawSubmitCpu.Add(native.DirectDrawSubmitCpuMilliseconds);
+            _directDrawGpu.Add(
+                gpuTimingValid ? native.DirectDrawGpuMilliseconds : double.NaN);
+            _cpuBlockingWait.Add(native.CpuBlockingWaitMilliseconds);
+            _gpuTimingLatencyFrames.Add(
+                gpuTimingValid ? native.GpuTimingLatencyFrames : double.NaN);
+            _sdlUpload.Add(pending.SdlUploadMilliseconds);
+            _enhancement.Add(pending.EnhancementMilliseconds);
+            _videoSubmit.Add(pending.VideoSubmitMilliseconds);
+            _uiBuild.Add(uiBuildMilliseconds);
+            _uiSubmit.Add(uiSubmitMilliseconds);
+            _present.Add(presentMilliseconds);
+            _decodedToPresent.Add(
+                Stopwatch.GetElapsedTime(
+                    pending.FrameAvailableTimestamp,
+                    presentedTimestamp).TotalMilliseconds);
+            _frameInterval.Add(
+                _lastPresentedTimestamp == 0
+                    ? double.NaN
+                    : Stopwatch.GetElapsedTime(
+                        _lastPresentedTimestamp,
+                        presentedTimestamp).TotalMilliseconds);
+            _lastPresentedTimestamp = presentedTimestamp;
 
             if (_conversion.Count == ReportingInterval)
             {
-                Log(quality, resolution, false);
+                Log(pending.Quality, pending.Resolution, false);
                 ResetSamples();
             }
         }
@@ -342,6 +528,7 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
             RtxVideoQuality quality,
             RtxVideoOutputResolution resolution)
         {
+            _pending = null;
             if (_conversion.Count != 0)
             {
                 Log(
@@ -352,6 +539,7 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
                 _activeQuality = null;
                 _activeResolution = null;
             }
+            _lastPresentedTimestamp = 0;
         }
 
         private void Log(
@@ -363,15 +551,34 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
             RtxVideoOutputSize size = RtxVideoOutputSize.From(resolution);
             Console.WriteLine(
                 $"[RTX VSR timing/{kind}] output={size.Width}x{size.Height} " +
-                $"quality={quality} frames={_conversion.Count}; " +
+                $"quality={quality} warmup={WarmupFrames} frames={_conversion.Count}; " +
+                $"decode_receive[{Describe(_decodeReceive)}] " +
                 $"convert[{Describe(_conversion)}] " +
+                $"bridge_host[{Describe(_bridgeHost)}] " +
+                $"upload_submit_cpu[{Describe(_uploadSubmitCpu)}] " +
+                $"upload_gpu[{Describe(_uploadGpu)}] " +
+                $"vsr_submit_cpu[{Describe(_evaluateCallCpu)}] " +
                 $"vsr_gpu[{Describe(_vsrGpu)}] " +
+                $"staging_copy_submit_cpu[{Describe(_copySubmitCpu)}] " +
+                $"staging_copy_gpu[{Describe(_copyGpu)}] " +
+                $"native_gpu[{Describe(_totalGpu)}] " +
                 $"native_process[{Describe(_nativeProcess)}] " +
                 $"readback[{Describe(_readback)}] " +
                 $"map_wait[{Describe(_mapWait)}] " +
                 $"row_copy[{Describe(_rowCopy)}] " +
+                $"query_resolve[{Describe(_queryResolve)}] " +
+                $"direct_draw_submit_cpu[{Describe(_directDrawSubmitCpu)}] " +
+                $"direct_draw_gpu[{Describe(_directDrawGpu)}] " +
+                $"cpu_blocking_wait[{Describe(_cpuBlockingWait)}] " +
+                $"gpu_timing_latency_frames[{Describe(_gpuTimingLatencyFrames)}] " +
                 $"sdl_upload[{Describe(_sdlUpload)}] " +
-                $"total[{Describe(_total)}]");
+                $"enhancement[{Describe(_enhancement)}] " +
+                $"sdl_video_submit[{Describe(_videoSubmit)}] " +
+                $"ui_build[{Describe(_uiBuild)}] " +
+                $"ui_submit[{Describe(_uiSubmit)}] " +
+                $"present[{Describe(_present)}] " +
+                $"decoded_to_present[{Describe(_decodedToPresent)}] " +
+                $"frame_interval[{Describe(_frameInterval)}]");
         }
 
         private static string Describe(List<double> samples)
@@ -402,14 +609,33 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
 
         private void ResetSamples()
         {
+            _decodeReceive.Clear();
             _conversion.Clear();
+            _bridgeHost.Clear();
+            _uploadSubmitCpu.Clear();
+            _uploadGpu.Clear();
+            _evaluateCallCpu.Clear();
             _nativeProcess.Clear();
             _vsrGpu.Clear();
+            _copySubmitCpu.Clear();
+            _copyGpu.Clear();
+            _totalGpu.Clear();
             _readback.Clear();
             _mapWait.Clear();
             _rowCopy.Clear();
+            _queryResolve.Clear();
+            _directDrawSubmitCpu.Clear();
+            _directDrawGpu.Clear();
+            _cpuBlockingWait.Clear();
+            _gpuTimingLatencyFrames.Clear();
             _sdlUpload.Clear();
-            _total.Clear();
+            _enhancement.Clear();
+            _videoSubmit.Clear();
+            _uiBuild.Clear();
+            _uiSubmit.Clear();
+            _present.Clear();
+            _decodedToPresent.Clear();
+            _frameInterval.Clear();
         }
     }
 }

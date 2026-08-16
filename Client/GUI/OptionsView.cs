@@ -196,6 +196,15 @@ namespace SysDVR.Client.GUI
 			Program.Options.Windows_RtxVideo.OutputResolution
 		);
 
+		readonly ComboEnum<RtxVideoPresentationBackend> RtxVideoPresentationBackends = new(
+			Program.Strings.Settings.RtxVideoPresentationBackend,
+			[
+				new(Program.Strings.Settings.RtxVideoBackendCpu, RtxVideoPresentationBackend.CpuReadback),
+				new(Program.Strings.Settings.RtxVideoBackendGpu, RtxVideoPresentationBackend.GpuDirectExperimental)
+			],
+			Program.Options.Windows_RtxVideo.PresentationBackend
+		);
+
 		readonly PathInputPopup PathInput = new();
 		readonly Gui.Popup ErrorPopup = new(Program.Strings.General.PopupErrorTitle);
 		string SettingsErrorMessage = "";
@@ -337,6 +346,8 @@ namespace SysDVR.Client.GUI
 					}
 					if (Program.Options.Windows_RtxVideo.Enabled)
 					{
+						RtxVideoPresentationBackends.Draw(
+							ref Program.Options.Windows_RtxVideo.PresentationBackend);
 						RtxVideoOutputResolutions.Draw(
 							ref Program.Options.Windows_RtxVideo.OutputResolution);
 						RtxVideoQualities.Draw(ref Program.Options.Windows_RtxVideo.Quality);

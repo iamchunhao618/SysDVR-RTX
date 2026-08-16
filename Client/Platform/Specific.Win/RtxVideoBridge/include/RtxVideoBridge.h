@@ -19,7 +19,7 @@
 extern "C" {
 #endif
 
-#define RVB_API_VERSION 2u
+#define RVB_API_VERSION 3u
 #define RVB_INPUT_WIDTH 1280u
 #define RVB_INPUT_HEIGHT 720u
 #define RVB_OUTPUT_1080P_WIDTH 1920u
@@ -115,7 +115,39 @@ typedef struct RvbFrameTiming
     double evaluate_gpu_ms;
     double readback_copy_gpu_ms;
     double total_gpu_ms;
+    double direct_draw_submit_cpu_ms;
+    double direct_draw_gpu_ms;
+    double cpu_blocking_wait_ms;
+    uint32_t direct_mode;
+    uint32_t gpu_timing_latency_frames;
 } RvbFrameTiming;
+
+#define RVB_ADAPTER_NAME_UTF8_SIZE 128u
+
+typedef struct RvbD3D11DeviceInfo
+{
+    uint32_t struct_size;
+    uint32_t adapter_index;
+    uint32_t adapter_vendor_id;
+    uint32_t adapter_device_id;
+    uint64_t adapter_dedicated_video_memory;
+    int32_t adapter_luid_high;
+    uint32_t adapter_luid_low;
+    uint32_t feature_level;
+    char adapter_name_utf8[RVB_ADAPTER_NAME_UTF8_SIZE];
+} RvbD3D11DeviceInfo;
+
+typedef struct RvbDirectRenderOptions
+{
+    uint32_t struct_size;
+    float destination_x;
+    float destination_y;
+    float destination_width;
+    float destination_height;
+    uint32_t target_width;
+    uint32_t target_height;
+    uint32_t rotation_quarter_turns;
+} RvbDirectRenderOptions;
 
 typedef struct RvbHandle RvbHandle;
 
@@ -129,10 +161,39 @@ RVB_API RvbStatus RVB_CALL rvb_create(
     const RvbCreateOptions* options,
     RvbHandle** handle);
 
+/*
+ * external_device must point to an ID3D11Device. The bridge AddRefs it for
+ * the handle lifetime and releases only that reference. Device ownership
+ * remains with the caller.
+ */
+RVB_API RvbStatus RVB_CALL rvb_create_with_d3d11_device(
+    const RvbCreateOptions* options,
+    void* external_device,
+    RvbHandle** handle);
+
+RVB_API RvbStatus RVB_CALL rvb_get_d3d11_device_info(
+    void* device,
+    RvbD3D11DeviceInfo* info);
+
 RVB_API RvbStatus RVB_CALL rvb_process_rgba8(
     RvbHandle* handle,
     const void* input,
     uint32_t input_stride,
+    void* output,
+    uint32_t output_stride);
+
+RVB_API RvbStatus RVB_CALL rvb_process_rgba8_gpu(
+    RvbHandle* handle,
+    const void* input,
+    uint32_t input_stride);
+
+RVB_API RvbStatus RVB_CALL rvb_render_output_d3d11(
+    RvbHandle* handle,
+    const RvbDirectRenderOptions* options);
+
+/* Explicit screenshot/debug readback; not used during normal GPU-direct frames. */
+RVB_API RvbStatus RVB_CALL rvb_readback_output_rgba8(
+    RvbHandle* handle,
     void* output,
     uint32_t output_stride);
 

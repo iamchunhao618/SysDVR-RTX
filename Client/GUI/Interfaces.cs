@@ -24,6 +24,11 @@ namespace SysDVR.Client.GUI
 
         public virtual void DrawDebug() { }
 
+        public virtual void RecordRenderTimings(
+            double uiBuildMilliseconds,
+            double uiSubmitMilliseconds,
+            double presentMilliseconds) { }
+
         public virtual void RawDraw()
         {
 			Program.SdlCtx.ClearScreen();

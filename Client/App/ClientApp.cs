@@ -364,6 +364,7 @@ public class ClientApp : IApplicationInstance
             if (Cap.Cap())
                 continue;
 
+            long uiBuildStart = Stopwatch.GetTimestamp();
             ImGuiSDL2Impl.Renderer_NewFrame();
             ImGuiSDL2Impl.SDL2_NewFrame();
             ImGui.NewFrame();
@@ -374,12 +375,24 @@ public class ClientApp : IApplicationInstance
                 DebugWindow();
 
             ImGui.Render();
+            double uiBuildMilliseconds = Stopwatch.GetElapsedTime(
+                uiBuildStart).TotalMilliseconds;
 
             CurrentView.RawDraw();
 
+            long uiSubmitStart = Stopwatch.GetTimestamp();
             ImGuiSDL2Impl.RenderDrawData(ImGui.GetDrawData());
+            double uiSubmitMilliseconds = Stopwatch.GetElapsedTime(
+                uiSubmitStart).TotalMilliseconds;
 
+            long presentStart = Stopwatch.GetTimestamp();
             sdlCtx.Render();
+            double presentMilliseconds = Stopwatch.GetElapsedTime(
+                presentStart).TotalMilliseconds;
+            CurrentView.RecordRenderTimings(
+                uiBuildMilliseconds,
+                uiSubmitMilliseconds,
+                presentMilliseconds);
         }
     break_main_loop:
 
