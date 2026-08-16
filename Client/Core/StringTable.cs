@@ -194,6 +194,22 @@ namespace SysDVR.Client.Core
 			public string PerformanceRenderingLabel = "These options affect the rendering pipeline of the client, when enabling 'uncapped' modes SysDVR-client will sync to the vsync event of your device, this should remove any latency due to the rendering pipeline but may use more power on mobile devices.";
 			public string UncapStreaming = "Uncap streaming framerate";
 			public string UncapGUI = "Uncap GUI framerate";
+
+			public string RtxVideoExperimental = "Experimental: Enable NVIDIA RTX Video Super Resolution";
+			public string RtxVideoOutputResolution = "RTX VSR output resolution";
+			public string RtxVideoOutput1080p = "1080p (1920x1080)";
+			public string RtxVideoOutput1440p = "1440p (2560x1440)";
+			public string RtxVideoOutput2160p = "2160p / 4K (3840x2160)";
+			public string RtxVideoQuality = "RTX VSR quality";
+			public string RtxVideoQualityLow = "Low";
+			public string RtxVideoQualityMedium = "Medium";
+			public string RtxVideoQualityHigh = "High";
+			public string RtxVideoQualityUltra = "Ultra";
+			public string RtxVideoPresentationBackend = "RTX VSR presentation path";
+			public string RtxVideoBackendCpu = "CPU readback (compatible)";
+			public string RtxVideoBackendGpu = "GPU direct (experimental, restart required)";
+			public string RtxVideoOutput = "The NVIDIA RTX Video SDK directly produces the selected output size.";
+			public string RtxVideoStatus = "RTX VSR status: {0}";
 			
 			public string PerformanceStreamingLabel = "These options affect the streaming quality of SysDVR, the defaults are usually fine";
 			

@@ -1,7 +1,10 @@
 ﻿using FFmpeg.AutoGen;
 using SysDVR.Client.Core;
+using SysDVR.Client.Platform.Specific.Win.RtxVideo;
 using SysDVR.Client.Sources;
 using System;
+using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -172,6 +175,23 @@ namespace SysDVR.Client.Targets.Player
         public IntPtr TargetTexture;
         public SDL_Rect TargetTextureSize;
 
+        IntPtr IYUVTexture;
+        SDL_Rect IYUVTextureSize;
+        IntPtr RtxTexture;
+        SDL_Rect RtxTextureSize;
+        RtxVideoEnhancer? RtxEnhancer;
+        readonly RtxVideoTelemetry RtxTelemetry = new();
+        RtxVideoQuality LastRtxQuality = RtxVideoQuality.Medium;
+        RtxVideoOutputResolution LastRtxResolution =
+            RtxVideoOutputResolution.QuadHd1440p;
+        bool GpuDirectUnavailable;
+        bool GpuDirectFrameReady;
+        long GpuDirectFrameAvailableTimestamp;
+        readonly string? ComparisonCaptureDirectory =
+            Environment.GetEnvironmentVariable("SYSDVR_RTX_CAPTURE_DIR");
+        int ComparisonCaptureCountdown = 60;
+        bool ComparisonCaptured;
+
         public VideoPlayer(string? preferredDecoderName)
         {
             InitVideoDecoder(preferredDecoderName);
@@ -199,9 +219,22 @@ namespace SysDVR.Client.Targets.Player
                     }
             }
 
-            TargetTextureSize = new SDL_Rect() { x = 0, y = 0, w = StreamInfo.VideoWidth, h = StreamInfo.VideoHeight };
-            TargetTexture = tex;
+            IYUVTextureSize = new SDL_Rect() { x = 0, y = 0, w = StreamInfo.VideoWidth, h = StreamInfo.VideoHeight };
+            IYUVTexture = tex;
+            UseIYUVTexture();
             TextureLock = new object();
+        }
+
+        void UseIYUVTexture()
+        {
+            TargetTexture = IYUVTexture;
+            TargetTextureSize = IYUVTextureSize;
+        }
+
+        void UseRtxTexture()
+        {
+            TargetTexture = RtxTexture;
+            TargetTextureSize = RtxTextureSize;
         }
 
         unsafe void InitVideoDecoder(string? name)
@@ -276,15 +309,373 @@ namespace SysDVR.Client.Targets.Player
 
         public unsafe bool DecodeFrame() 
         {
-            if (DecodeFrameInternal())
+            if (DecodeFrameInternal(
+                out long frameAvailableTimestamp,
+                out double decodeReceiveMilliseconds))
             {
                 // TODO: this call is needed only with opengl on linux (and not on every linux install i tested) where TextureUpdate must be called by the main thread,
                 // Check if are there any performance improvements by moving this to the decoder thread on other OSes
+                if (Program.IsWindows && Program.Options.Windows_RtxVideo.Enabled)
+                {
+                    if (TryUpdateRtxTexture(
+                        Decoder.RenderFrame,
+                        frameAvailableTimestamp,
+                        decodeReceiveMilliseconds))
+                        return true;
+                }
+                else
+                {
+                    StopRtxEnhancer();
+                }
+
+                UseIYUVTexture();
                 UpdateSDLTexture(Decoder.RenderFrame);
+                TryCaptureComparison(IYUVTexture, "vanilla_720p");
 
                 return true;
             }
             return false;
+        }
+
+        unsafe bool TryUpdateRtxTexture(
+            AVFrame* frame,
+            long frameAvailableTimestamp,
+            double decodeReceiveMilliseconds)
+        {
+            if (RtxVideoSupport.SessionDisabled)
+            {
+                StopRtxEnhancer();
+                return false;
+            }
+
+            RtxVideoQuality quality = Program.Options.Windows_RtxVideo.Quality;
+            RtxVideoOutputResolution resolution =
+                Program.Options.Windows_RtxVideo.OutputResolution;
+            RtxVideoPresentationBackend requestedBackend =
+                Program.Options.Windows_RtxVideo.PresentationBackend;
+            RtxVideoPresentationBackend backend = requestedBackend;
+            if (backend == RtxVideoPresentationBackend.GpuDirectExperimental &&
+                (GpuDirectUnavailable || !Program.SdlCtx.UsingD3D11Renderer))
+            {
+                if (!GpuDirectUnavailable)
+                {
+                    Console.WriteLine(
+                        "[RTX VSR] GPU direct requires the SDL direct3d11 renderer selected " +
+                        "at application startup; using CPU readback for this stream.");
+                }
+                GpuDirectUnavailable = true;
+                backend = RtxVideoPresentationBackend.CpuReadback;
+            }
+
+            LastRtxQuality = quality;
+            LastRtxResolution = resolution;
+            for (int attempt = 0; attempt < 2; ++attempt)
+            {
+                if (RtxEnhancer is not null &&
+                    (RtxEnhancer.OutputResolution != resolution ||
+                     RtxEnhancer.PresentationBackend != backend))
+                {
+                    StopRtxEnhancer();
+                    DestroyRtxTexture();
+                }
+
+                RtxEnhancer ??= RtxVideoEnhancer.TryCreate(
+                    quality,
+                    resolution,
+                    backend,
+                    Program.SdlCtx.RendererHandle);
+                if (RtxEnhancer is null)
+                {
+                    if (backend ==
+                        RtxVideoPresentationBackend.GpuDirectExperimental)
+                    {
+                        GpuDirectUnavailable = true;
+                        backend = RtxVideoPresentationBackend.CpuReadback;
+                        continue;
+                    }
+                    return false;
+                }
+
+                if (!RtxEnhancer.TryProcess(frame, quality, out var frameTiming))
+                {
+                    bool failedDirect = RtxEnhancer.IsGpuDirect;
+                    StopRtxEnhancer();
+                    if (failedDirect)
+                    {
+                        GpuDirectUnavailable = true;
+                        backend = RtxVideoPresentationBackend.CpuReadback;
+                        continue;
+                    }
+                    return false;
+                }
+
+                try
+                {
+                    double uploadMilliseconds = 0.0;
+                    if (RtxEnhancer.IsGpuDirect)
+                    {
+                        GpuDirectFrameReady = true;
+                        GpuDirectFrameAvailableTimestamp = frameAvailableTimestamp;
+                    }
+                    else
+                    {
+                        EnsureRtxTexture();
+                        long uploadStart = Stopwatch.GetTimestamp();
+                        int uploadResult = SDL_UpdateTexture(
+                            RtxTexture,
+                            ref RtxTextureSize,
+                            RtxEnhancer.OutputBuffer,
+                            RtxEnhancer.OutputStride);
+                        uploadMilliseconds = Stopwatch.GetElapsedTime(
+                            uploadStart).TotalMilliseconds;
+                        if (uploadResult != 0)
+                        {
+                            throw new InvalidOperationException(
+                                $"SDL_UpdateTexture(RGBA8) failed: {SDL_GetError()}");
+                        }
+                        UseRtxTexture();
+                    }
+
+                    double pathMilliseconds = Stopwatch.GetElapsedTime(
+                        frameAvailableTimestamp).TotalMilliseconds;
+                    RtxTelemetry.BeginFrame(
+                        quality, resolution, frameTiming,
+                        decodeReceiveMilliseconds,
+                        uploadMilliseconds,
+                        pathMilliseconds,
+                        frameAvailableTimestamp);
+                    if (!RtxEnhancer.IsGpuDirect)
+                    {
+                        TryCaptureComparison(
+                            RtxTexture,
+                            $"vsr_{RtxEnhancer.OutputHeight}p_{quality.ToString().ToLowerInvariant()}");
+                    }
+                    return true;
+                }
+                catch (Exception error)
+                {
+                    RtxVideoSupport.DisableForSession(error.Message);
+                    StopRtxEnhancer();
+                    return false;
+                }
+            }
+            return false;
+        }
+
+        public void RecordVideoRenderSubmission(
+            double milliseconds,
+            RtxVideoNativeFrameTiming? directTiming = null,
+            double? enhancementMilliseconds = null) =>
+            RtxTelemetry.RecordVideoSubmission(
+                milliseconds, directTiming, enhancementMilliseconds);
+
+        public unsafe bool TryRenderGpuDirect(
+            in SDL_Rect destination,
+            int rotationQuarterTurns,
+            out double submissionMilliseconds)
+        {
+            submissionMilliseconds = 0.0;
+            if (!GpuDirectFrameReady || RtxEnhancer?.IsGpuDirect != true)
+                return false;
+
+            long submissionStart = Stopwatch.GetTimestamp();
+            try
+            {
+                // SDL's D3D11 ClearRenderTargetView does not bind the RTV after a
+                // flip. Queue one clipped/offscreen primitive so the documented
+                // flush leaves the current window render target bound for the
+                // native pass. This uses only public SDL rendering APIs.
+                if (SDL_RenderDrawPoint(
+                    Program.SdlCtx.RendererHandle, -10000, -10000) != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"SDL offscreen target-bind draw failed: {SDL_GetError()}");
+                }
+                if (SDL_RenderFlush(Program.SdlCtx.RendererHandle) != 0)
+                {
+                    throw new InvalidOperationException(
+                        $"SDL_RenderFlush before GPU-direct draw failed: {SDL_GetError()}");
+                }
+
+                var scale = Program.SdlCtx.RendererScale;
+                var pixelSize = Program.SdlCtx.RendererPixelSize;
+                RtxVideoDirectRenderOptions renderOptions = new()
+                {
+                    DestinationX = destination.x * scale.X,
+                    DestinationY = destination.y * scale.Y,
+                    DestinationWidth = destination.w * scale.X,
+                    DestinationHeight = destination.h * scale.Y,
+                    TargetWidth = checked((uint)pixelSize.X),
+                    TargetHeight = checked((uint)pixelSize.Y),
+                    RotationQuarterTurns = checked((uint)rotationQuarterTurns),
+                };
+                if (!RtxEnhancer.TryRenderGpuDirect(
+                    renderOptions, out RtxVideoNativeFrameTiming nativeTiming))
+                {
+                    throw new InvalidOperationException(
+                        RtxEnhancer.FailureReason ?? "GPU-direct draw failed.");
+                }
+
+                submissionMilliseconds = Stopwatch.GetElapsedTime(
+                    submissionStart).TotalMilliseconds;
+                double enhancementMilliseconds = Stopwatch.GetElapsedTime(
+                    GpuDirectFrameAvailableTimestamp).TotalMilliseconds;
+                RecordVideoRenderSubmission(
+                    submissionMilliseconds,
+                    nativeTiming,
+                    enhancementMilliseconds);
+                TryCaptureDirectComparison();
+                return true;
+            }
+            catch (Exception error)
+            {
+                submissionMilliseconds = Stopwatch.GetElapsedTime(
+                    submissionStart).TotalMilliseconds;
+                GpuDirectUnavailable = true;
+                StopRtxEnhancer();
+                UseIYUVTexture();
+                UpdateSDLTexture(Decoder.RenderFrame);
+                Console.WriteLine(
+                    $"[RTX VSR] GPU-direct presentation fell back to vanilla IYUV: {error.Message}");
+                return false;
+            }
+        }
+
+        public void RecordPresentation(
+            double uiBuildMilliseconds,
+            double uiSubmitMilliseconds,
+            double presentMilliseconds) =>
+            RtxTelemetry.CompleteFrame(
+                uiBuildMilliseconds,
+                uiSubmitMilliseconds,
+                presentMilliseconds);
+
+        void EnsureRtxTexture()
+        {
+            if (RtxTexture != 0 &&
+                RtxTextureSize.w == RtxEnhancer!.OutputWidth &&
+                RtxTextureSize.h == RtxEnhancer.OutputHeight)
+                return;
+
+            DestroyRtxTexture();
+
+            Program.SdlCtx.BugCheckThreadId();
+            RtxTexture = SDL_CreateTexture(
+                Program.SdlCtx.RendererHandle,
+                SDL_PIXELFORMAT_ABGR8888,
+                (int)SDL_TextureAccess.SDL_TEXTUREACCESS_STREAMING,
+                RtxEnhancer!.OutputWidth,
+                RtxEnhancer.OutputHeight);
+            if (RtxTexture == 0)
+            {
+                throw new InvalidOperationException(
+                    $"SDL_CreateTexture({RtxEnhancer.OutputWidth}x{RtxEnhancer.OutputHeight} RGBA8) failed: {SDL_GetError()}");
+            }
+
+            RtxTextureSize = new SDL_Rect
+            {
+                x = 0,
+                y = 0,
+                w = RtxEnhancer.OutputWidth,
+                h = RtxEnhancer.OutputHeight,
+            };
+            Console.WriteLine(
+                $"[RTX VSR] Created separate {RtxEnhancer.OutputWidth}x{RtxEnhancer.OutputHeight} " +
+                "SDL_PIXELFORMAT_ABGR8888 " +
+                "streaming texture (RGBA byte order on little-endian Windows).");
+        }
+
+        void DestroyRtxTexture()
+        {
+            if (RtxTexture == 0)
+                return;
+
+            UseIYUVTexture();
+            SDL_DestroyTexture(RtxTexture);
+            RtxTexture = 0;
+            RtxTextureSize = default;
+        }
+
+        void TryCaptureComparison(IntPtr texture, string name)
+        {
+            if (ComparisonCaptured ||
+                string.IsNullOrWhiteSpace(ComparisonCaptureDirectory) ||
+                --ComparisonCaptureCountdown > 0)
+            {
+                return;
+            }
+
+            ComparisonCaptured = true;
+            try
+            {
+                Directory.CreateDirectory(ComparisonCaptureDirectory);
+                string path = Path.Combine(
+                    ComparisonCaptureDirectory, name + ".png");
+                SDLCapture.ExportTexture(texture, path);
+                Console.WriteLine($"[RTX VSR comparison] Captured {path}");
+            }
+            catch (Exception error)
+            {
+                Console.WriteLine(
+                    $"[RTX VSR comparison] Capture failed: {error.Message}");
+            }
+        }
+
+        void TryCaptureDirectComparison()
+        {
+            if (ComparisonCaptured ||
+                string.IsNullOrWhiteSpace(ComparisonCaptureDirectory) ||
+                --ComparisonCaptureCountdown > 0 ||
+                RtxEnhancer?.IsGpuDirect != true)
+            {
+                return;
+            }
+
+            ComparisonCaptured = true;
+            try
+            {
+                Directory.CreateDirectory(ComparisonCaptureDirectory);
+                string path = Path.Combine(
+                    ComparisonCaptureDirectory,
+                    $"vsr_{RtxEnhancer.OutputHeight}p_" +
+                    $"{LastRtxQuality.ToString().ToLowerInvariant()}_gpu_direct.png");
+                using SDLCapture capture = CaptureCurrentFrame();
+                SDLCapture.Export(capture, path);
+                Console.WriteLine(
+                    $"[RTX VSR comparison] Captured explicit GPU readback to {path}");
+            }
+            catch (Exception error)
+            {
+                Console.WriteLine(
+                    $"[RTX VSR comparison] GPU-direct capture failed: {error.Message}");
+            }
+        }
+
+        public SDLCapture CaptureCurrentFrame()
+        {
+            Program.SdlCtx.BugCheckThreadId();
+            if (GpuDirectFrameReady && RtxEnhancer?.IsGpuDirect == true)
+            {
+                nint pixels = RtxEnhancer.ReadbackForScreenshot();
+                return SDLCapture.CaptureRgba(
+                    pixels,
+                    RtxEnhancer.OutputWidth,
+                    RtxEnhancer.OutputHeight,
+                    RtxEnhancer.OutputStride);
+            }
+            return SDLCapture.CaptureTexture(TargetTexture);
+        }
+
+        void StopRtxEnhancer()
+        {
+            GpuDirectFrameReady = false;
+            GpuDirectFrameAvailableTimestamp = 0;
+            if (RtxEnhancer is null)
+                return;
+
+            RtxTelemetry.Flush(LastRtxQuality, LastRtxResolution);
+            RtxEnhancer.Dispose();
+            RtxEnhancer = null;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -296,7 +687,7 @@ namespace SysDVR.Client.Targets.Player
         {
             if (pic->linesize[0] > 0 && pic->linesize[1] > 0 && pic->linesize[2] > 0)
             {
-                SDL_UpdateYUVTexture(TargetTexture, ref TargetTextureSize,
+                SDL_UpdateYUVTexture(IYUVTexture, ref IYUVTextureSize,
                     (IntPtr)pic->data[0], pic->linesize[0],
                     (IntPtr)pic->data[1], pic->linesize[1],
                     (IntPtr)pic->data[2], pic->linesize[2]);
@@ -306,7 +697,7 @@ namespace SysDVR.Client.Targets.Player
             else if (pic->linesize[0] < 0 && pic->linesize[1] < 0 && pic->linesize[2] < 0)
             {
                 Program.DebugLog("Negative Linesize");
-                SDL_UpdateYUVTexture(TargetTexture, ref TargetTextureSize,
+                SDL_UpdateYUVTexture(IYUVTexture, ref IYUVTextureSize,
                     (IntPtr)(pic->data[0] + pic->linesize[0] * (pic->height - 1)), -pic->linesize[0],
                     (IntPtr)(pic->data[1] + pic->linesize[1] * (av_ceil_rshift(pic->height, 1) - 1)), -pic->linesize[1],
                     (IntPtr)(pic->data[2] + pic->linesize[2] * (av_ceil_rshift(pic->height, 1) - 1)), -pic->linesize[2]);
@@ -315,18 +706,25 @@ namespace SysDVR.Client.Targets.Player
             // While this doesn't seem to be handled in ffplay but the texture can be non-planar with some decoders
             else if (pic->linesize[0] > 0 && pic->linesize[1] == 0)
             {
-                SDL_UpdateTexture(TargetTexture, ref TargetTextureSize, (nint)pic->data[0], pic->linesize[0]);
+                SDL_UpdateTexture(IYUVTexture, ref IYUVTextureSize, (nint)pic->data[0], pic->linesize[0]);
             }
             else Console.WriteLine($"Error: Non-positive planar linesizes are not supported, open an issue on Github. {pic->linesize[0]} {pic->linesize[1]} {pic->linesize[2]}");
         }
 
         bool converterFirstFrameCheck = false;
-        unsafe bool DecodeFrameInternal()
+        unsafe bool DecodeFrameInternal(
+            out long frameAvailableTimestamp,
+            out double decodeReceiveMilliseconds)
         {
+            frameAvailableTimestamp = 0;
+            decodeReceiveMilliseconds = 0;
             int ret = 0;
 
+            long decodeReceiveStart = Stopwatch.GetTimestamp();
             lock (Decoder.CodecLock)
                 ret = avcodec_receive_frame(Decoder.CodecCtx, Decoder.ReceiveFrame);
+            decodeReceiveMilliseconds = Stopwatch.GetElapsedTime(
+                decodeReceiveStart).TotalMilliseconds;
 
             if (ret == AVERROR(EAGAIN))
             {
@@ -341,6 +739,7 @@ namespace SysDVR.Client.Targets.Player
             }
             else
             {
+                frameAvailableTimestamp = Stopwatch.GetTimestamp();
                 // On the first frame we get check if we need to use a converter
                 if (!converterFirstFrameCheck && Decoder.CodecCtx->pix_fmt != AVPixelFormat.AV_PIX_FMT_NONE)
                 {
@@ -360,6 +759,12 @@ namespace SysDVR.Client.Targets.Player
                     var source = Decoder.ReceiveFrame;
                     var target = Decoder.RenderFrame;
                     sws_scale(Converter.Converter, source->data, source->linesize, 0, source->height, target->data, target->linesize);
+                    // Preserve decoded color metadata for the optional RTX RGB conversion.
+                    target->color_range = source->color_range;
+                    target->colorspace = source->colorspace;
+                    target->color_primaries = source->color_primaries;
+                    target->color_trc = source->color_trc;
+                    target->chroma_location = source->chroma_location;
                 }
                 else
                 {
@@ -409,6 +814,8 @@ namespace SysDVR.Client.Targets.Player
 
         public unsafe void Dispose()
         {
+            StopRtxEnhancer();
+
             var ptr = Decoder.Frame1;
             av_frame_free(&ptr);
 
@@ -426,8 +833,15 @@ namespace SysDVR.Client.Targets.Player
                 sws_freeContext(Converter.Converter);
             }
 
-            if (TargetTexture != 0)
-                SDL_DestroyTexture(TargetTexture);
+            DestroyRtxTexture();
+
+            if (IYUVTexture != 0)
+            {
+                SDL_DestroyTexture(IYUVTexture);
+                IYUVTexture = 0;
+            }
+
+            TargetTexture = 0;
 
             Decoder.OnFrameEvent.Dispose();
         }

@@ -3,11 +3,11 @@
 		<TargetFramework>net9.0</TargetFramework>
 		<Platforms>AnyCPU</Platforms>
 		<AssemblyName>SysDVR-Client</AssemblyName>
-		<Description>https://github.com/exelix11/SysDVR</Description>
-		<Authors>exelix</Authors>
+		<Description>Experimental SysDVR fork with NVIDIA RTX Video Super Resolution</Description>
+		<Authors>exelix; SysDVR RTX contributors</Authors>
 		<Company />
-		<PackageProjectUrl>https://github.com/exelix11/SysDVR</PackageProjectUrl>
-		<RepositoryUrl>https://github.com/exelix11/SysDVR</RepositoryUrl>
+		<PackageProjectUrl>https://github.com/iamchunhao618/SysDVR-RTX</PackageProjectUrl>
+		<RepositoryUrl>https://github.com/iamchunhao618/SysDVR-RTX</RepositoryUrl>
 		<RootNamespace>SysDVR.Client</RootNamespace>
 		<ApplicationIcon>Client.ico</ApplicationIcon>
 		<RollForward>Major</RollForward>

@@ -41,8 +41,8 @@ namespace SysDVR.Client.GUI
         {
             Popups.Add(initErrorPopup);
 
-            Heading = "SysDVR-Client " + Program.DisplayVersion;
-            SecondLine = $"build id {Program.BuildID}";
+            Heading = "SysDVR RTX VSR " + Program.ForkReleaseVersion;
+            SecondLine = $"SysDVR {Program.DisplayVersion} base · build {Program.BuildID}";
             DevelopmentBuild = TextEncoding.ToPlainText("Welcome to SysDVR-dev, do not open github issues for development versions as they come with no support");
 
             UpdateDiskPermissionStatus();
@@ -158,7 +158,7 @@ namespace SysDVR.Client.GUI
 
             centerOptions.StartHere();
 			if (ImGui.Button(Strings.GithubButton))
-				SystemUtil.OpenURL("https://github.com/exelix11/SysDVR/");
+				SystemUtil.OpenURL(Program.ForkRepositoryUrl);
 
 			ImGui.SameLine();
 			if (ImGui.Button(Strings.GuideButton))

@@ -93,10 +93,48 @@ namespace SysDVR.Client.Targets
 			}
 		}
 
+		public static SDLCapture CaptureRgba(
+			IntPtr pixels,
+			int width,
+			int height,
+			int sourcePitch)
+		{
+			Program.SdlCtx.BugCheckThreadId();
+			if (pixels == IntPtr.Zero || width <= 0 || height <= 0 ||
+				sourcePitch < checked(width * 4))
+				throw new ArgumentException("Invalid RGBA screenshot buffer.");
+
+			var surface = (SDL_Surface*)SDL_CreateRGBSurfaceWithFormat(
+				0, width, height, 32, SDL_PIXELFORMAT_ABGR8888)
+				.AssertNotNull(SDL_GetError)
+				.ToPointer();
+			try
+			{
+				int rowBytes = checked(width * 4);
+				for (int row = 0; row < height; ++row)
+				{
+					Buffer.MemoryCopy(
+						(void*)(pixels + row * sourcePitch),
+						(void*)(surface->pixels + row * surface->pitch),
+						surface->pitch,
+						rowBytes);
+				}
+				return new SDLCapture(width, height, surface);
+			}
+			catch
+			{
+				SDL_FreeSurface((IntPtr)surface);
+				throw;
+			}
+		}
+
+		public static void Export(SDLCapture capture, string savePath) =>
+			IMG_SavePNG((IntPtr)capture.surface, savePath).AssertZero(IMG_GetError);
+
 		public static unsafe void ExportTexture(IntPtr texture, string savePath) 
         {
 			using var capture = CaptureTexture(texture);
-			IMG_SavePNG((IntPtr)capture.surface, savePath).AssertZero(IMG_GetError);
+			Export(capture, savePath);
 		}
 	}
 }

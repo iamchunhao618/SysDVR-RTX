@@ -27,6 +27,37 @@ namespace SysDVR.Client.Core
         Auto
     }
 
+    public enum RtxVideoQuality
+    {
+        Low = 1,
+        Medium = 2,
+        High = 3,
+        Ultra = 4,
+    }
+
+    public enum RtxVideoOutputResolution
+    {
+        FullHd1080p = 1080,
+        QuadHd1440p = 1440,
+        UltraHd2160p = 2160,
+    }
+
+    public enum RtxVideoPresentationBackend
+    {
+        CpuReadback = 0,
+        GpuDirectExperimental = 1,
+    }
+
+    public class RtxVideoOptions
+    {
+        public bool Enabled = false;
+        public RtxVideoOutputResolution OutputResolution =
+            RtxVideoOutputResolution.QuadHd1440p;
+        public RtxVideoQuality Quality = RtxVideoQuality.Medium;
+        public RtxVideoPresentationBackend PresentationBackend =
+            RtxVideoPresentationBackend.CpuReadback;
+    }
+
     public class Options
     {
         public bool UncapStreaming;
@@ -41,6 +72,9 @@ namespace SysDVR.Client.Core
 
         // (Windows only) Capture screenshots to clipboard by default
         public bool Windows_ScreenToClip = false;
+
+        // (Windows only) Local experimental RTX Video Super Resolution path.
+        public RtxVideoOptions Windows_RtxVideo = new();
 
 		// Usb logging options
 		[JsonIgnore]

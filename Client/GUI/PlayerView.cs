@@ -211,6 +211,13 @@ namespace SysDVR.Client.GUI
             if (Video is null)
                 return;
 
+            if (Video.TryRenderGpuDirect(
+                DisplayRect, RotationQuarterTurns, out _))
+            {
+                return;
+            }
+
+            long submitStart = System.Diagnostics.Stopwatch.GetTimestamp();
             if (RotationQuarterTurns == 0)
             {
                 SDL_RenderCopy(Program.SdlCtx.RendererHandle, Video.TargetTexture, ref Video.TargetTextureSize, ref DisplayRect);
@@ -219,6 +226,20 @@ namespace SysDVR.Client.GUI
             {
                 SDL_RenderCopyEx(Program.SdlCtx.RendererHandle, Video.TargetTexture, ref Video.TargetTextureSize, ref DisplayRect, RotationQuarterTurns * 90, IntPtr.Zero, SDL_RendererFlip.SDL_FLIP_NONE);
             }
+            Video.RecordVideoRenderSubmission(
+                System.Diagnostics.Stopwatch.GetElapsedTime(
+                    submitStart).TotalMilliseconds);
+        }
+
+        public void RecordRenderTimings(
+            double uiBuildMilliseconds,
+            double uiSubmitMilliseconds,
+            double presentMilliseconds)
+        {
+            Video?.RecordPresentation(
+                uiBuildMilliseconds,
+                uiSubmitMilliseconds,
+                presentMilliseconds);
         }
 
         private unsafe void InitializeLoadingTexture()
@@ -600,7 +621,7 @@ namespace SysDVR.Client.GUI
             if (!Program.IsWindows)
                 throw new Exception("Screenshots to clipboard are only supported on windows");
 
-            using (var cap = SDLCapture.CaptureTexture(player.Video.TargetTexture))
+            using (var cap = player.Video.CaptureCurrentFrame())
                 Platform.Specific.Win.WinClipboard.CopyCapture(cap);
 
             MessageUi(Strings.ScreenshotSavedToClip);
@@ -609,7 +630,8 @@ namespace SysDVR.Client.GUI
         void ScreenshotToFile()
         {
             var path = Program.Options.GetFilePathForScreenshot();
-            SDLCapture.ExportTexture(player.Video.TargetTexture, path);
+            using var capture = player.Video.CaptureCurrentFrame();
+            SDLCapture.Export(capture, path);
             MessageUi(string.Format(Strings.ScreenshotSaved, path));
         }
 
@@ -699,6 +721,17 @@ namespace SysDVR.Client.GUI
         {
             base.RawDraw();
             player.DrawAsync();
+        }
+
+        public override void RecordRenderTimings(
+            double uiBuildMilliseconds,
+            double uiSubmitMilliseconds,
+            double presentMilliseconds)
+        {
+            player.RecordRenderTimings(
+                uiBuildMilliseconds,
+                uiSubmitMilliseconds,
+                presentMilliseconds);
         }
 
         public override void ResolutionChanged()

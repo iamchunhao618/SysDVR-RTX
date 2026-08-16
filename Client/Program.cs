@@ -20,6 +20,9 @@ namespace SysDVR.Client
 {
     public static class Program
     {
+        public const string ForkReleaseVersion = "0.1.0-beta";
+        public const string ForkRepositoryUrl = "https://github.com/iamchunhao618/SysDVR-RTX";
+
         // Currently android needs a special ifdef due to dotnet8 not supporting this API yet (i think it's cause the target is linux-bionic rather than android ?)
 #if ANDROID_LIB
 		public readonly static bool IsWindows = false;
@@ -133,8 +136,9 @@ namespace SysDVR.Client
                 {
                     DynamicLibraryLoader.Initialize();
 
-                    Console.WriteLine($"SysDVR-Client {DisplayVersion} - by exelix");
-                    Console.WriteLine("https://github.com/exelix11/SysDVR");
+                    Console.WriteLine($"SysDVR RTX VSR {ForkReleaseVersion} (SysDVR-Client {DisplayVersion})");
+                    Console.WriteLine("Based on SysDVR by exelix");
+                    Console.WriteLine(ForkRepositoryUrl);
                     Console.WriteLine($"Build ID: {BuildID}\n");
 
                     var cli = CommandLineOptions.Parse(args);

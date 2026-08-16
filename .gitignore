@@ -372,3 +372,20 @@ Client/Platform/Linux/tmp/
 Client/Platform/Linux/shared-modules/
 Client/Platform/Linux-x64.zip
 Client/Platform/Resources/linux-x64/native/
+
+# Local NVIDIA RTX Video SDK inputs and generated bridge artifacts.
+# The official SDK, feature modules, headers, and libraries are never vendored.
+*.dll
+*.lib
+*.exp
+nvsdk_ngx*.h
+nvngx_vsr.dll
+**/RTX_Video_SDK*/
+**/RTXVideoSDK*/
+**/NVIDIA_RTX_Video_SDK*/
+Client/Platform/Specific.Win/RtxVideoBridge/build/
+Client/Platform/Resources/win-x64/native/
+
+# Local RTX VSR benchmark output and captures, including development-watermarked media.
+experiments/RtxVideoBridgeTest/build/
+experiments/RtxVideoBridgeTest/results/

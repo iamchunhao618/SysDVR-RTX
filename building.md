@@ -1,74 +1,89 @@
-# Compiling SysDVR
+# Building SysDVR RTX VSR
 
-This file explains how to build SysDVR from source locally. If you are looking for prebuilt binaries, check out the [releases page](https://github.com/exelix11/SysDVR/releases/).
+This repository contains the original SysDVR Switch sysmodule, its settings application, and the cross-platform client. The RTX VSR extension affects only the Windows x64 client.
 
-These instructions were written as of SysDVR v6.0, for previous or future versions you can verify any changes in the [CI build scripts](https://github.com/exelix11/SysDVR/tree/master/.github/workflows) which should always be up to date.
+No NVIDIA SDK file is vendored or downloaded by this repository. Obtain the official NVIDIA RTX Video SDK 1.1.0 separately and comply with its license.
 
-The SysDVR project is composed of three components that must be buit individually, these are the [SysDVR sysmodule](https://github.com/exelix11/SysDVR/tree/master/sysmodule), its [Settings homebrew](https://github.com/exelix11/SysDVR/tree/master/SysDVRConfig) and [SysDVR client](https://github.com/exelix11/SysDVR/tree/master/Client).
+## Windows RTX client prerequisites
 
-# Sysmodule and Settings
+- Windows 10 or Windows 11 x64
+- .NET 9 SDK
+- Visual Studio 2022 Build Tools with Desktop development with C++, Windows SDK, and CMake
+- 7-Zip available as `7z.exe`
+- Official NVIDIA RTX Video SDK 1.1.0
+- A supported NVIDIA RTX GPU and compatible driver for runtime testing
 
-These are regular switch homebrew projects, you can build them using the devkitA64 toolchain from DevKitPro.
+## Clean Windows Release build
 
-Switch projects use a `Makefile` to build, there are certain special compliation flags that can be used to toggle SysDVR features, the most relevant is `USB_ONLY`, to be set by runnin `make -j DEFINES="-DUSB_ONLY"` which produces the USB-only version of SysDVR.
+Set the SDK environment variable to a location outside the repository:
 
-There are other flags meant for debugging, these are not stable and not documented here.
+```powershell
+$env:RTX_VIDEO_SDK_DIR = 'D:\SDKs\RTX_Video_SDK_1.1.0' # replace this
+```
 
-# Client
+Populate the original SysDVR Windows native dependencies. The upstream script downloads its pinned FFmpeg, SDL, libusb, and cimgui dependencies and performs an initial publish:
 
-The client is a cross platform C# project that runs on Windows, Linux, MacOS (both intel and arm) and Android.
+```powershell
+Push-Location .\Client\Platform
+cmd.exe /c BuildWindows.bat
+Pop-Location
+```
 
-The wide range of supported platforms causes the build process to be a bit more complex than the sysmodule.
+Build the native bridge. It consumes NVIDIA headers and the import/static library from `RTX_VIDEO_SDK_DIR`, writes build products only to ignored directories, and does not copy NVIDIA SDK files:
 
-The client is built as a NativeAOT application, meaning that each platform gets its own native executable that can be launched without the need for the dotnet runtime.
-The following platforms are distributed as NativeAOT binaries:
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass `
+  -File .\Client\Platform\Specific.Win\RtxVideoBridge\Build-RtxVideoBridge.ps1 `
+  -SdkDirectory $env:RTX_VIDEO_SDK_DIR -Configuration Release
+```
 
-- Windows x64
-- Linux x64 (flatpak)
-- MacOS x64 and arm64
-- Android arm64
+Build and publish the managed client:
 
-To support other platforms, most notably Linux on arm such as the Raspberry Pi, you will need to build the client from source.
+```powershell
+dotnet restore .\Client\Client.csproj -r win-x64 -p:SysDvrTarget=windows
+dotnet build .\Client\Client.csproj -c Release -r win-x64 `
+  -p:SysDvrTarget=windows --no-restore
+dotnet publish .\Client\Client.csproj -c Release -r win-x64 `
+  --self-contained true -p:SysDvrTarget=windows --no-restore
+```
 
-The build script for each platform is located in the Client/Platform folder.
+The publish directory is `Client/bin/Release/net9.0/win-x64/publish`.
 
-## Build tools
+For local testing, set the feature directory instead of copying `nvngx_vsr.dll` into source control:
 
-SysDVR requires dotnet 8.0 to build, the android version additionaly requires the native android SDK and android studio.
+```powershell
+$env:SYSDVR_RTX_VIDEO_FEATURE_DIR = `
+  Join-Path $env:RTX_VIDEO_SDK_DIR 'bin\Windows\x64\dev'
+```
 
-## Client build
+The development feature module adds a visible `DO NOT DISTRIBUTE` watermark. Do not publish that DLL or output captured from it.
 
-The client uses a .NET csproj to build, using the dotnet CLI should be enough to build a managed (requires dotnet runtime) version of the client. This is ideal for development as, once you have the native libraries installed, you can just run and debug the client from Visual Studio or VSCode.
+## Native smoke test
 
-The following are the build scripts for each platform, they are also tasked to download the native libraries:
-- [Windows](https://github.com/exelix11/SysDVR/blob/master/Client/Platform/BuildWindows.bat)
-- [MacOs](https://github.com/exelix11/SysDVR/blob/master/Client/Platform/BuildMacos.sh)
-- [Linux](https://github.com/exelix11/SysDVR/blob/master/Client/Platform/Linux/build-flatpak.sh) (flatpak, will compile the dependencies from source)
-- [Android](https://github.com/exelix11/SysDVR/blob/master/Client/Platform/Android/buildbinaries.sh)
+After building the bridge:
 
-Android builds are special as they require the additional `/p:SysDvrTarget=android` parameter for some platform specific code to be included. This is an option for other platforms as well but as of now it is not used, you should use the current build scripts as reference.
-Furthermore, the android build process requires to use gradle or android studio to build the final APK, the `buildbinaries.sh` script will only prepare dependencies and the SysDVR client AOT library.
+```powershell
+$feature = Join-Path $env:RTX_VIDEO_SDK_DIR 'bin\Windows\x64\dev'
+& .\Client\Platform\Specific.Win\RtxVideoBridge\build\Release\RtxVideoBridgeSmokeTest.exe `
+  $feature 2
+```
 
-## Dependencies 
+The optional second argument selects quality `0..4`; the optional third argument selects a DXGI adapter index.
 
-Before being able to run the compiled client, regardless of managed or aot builds, you will need to obtain the executable files for all the native dependencies the client uses.
+## Standalone benchmark
 
-These are:
-- ffmpeg (libavcodec, libavformat, libavutil, libswscale, etc)
-- SDL2
-- SDL_image
-- LibUSB (only if you plan to use usb streaming)
-- [CimguiSDL2Cross](https://github.com/exelix11/CimguiSDL2Cross)
-	- This is a fork of the open source cimgui project with some SDL-specific tweaks. It is built by the CI on that repo and i release the binary packages so they can be downloaded by the build scripts.
+The standalone D3D11 test lives in `experiments/RtxVideoBridgeTest`. Its [README](experiments/RtxVideoBridgeTest/README.md) documents the build and benchmark arguments. Generated images, CSV/JSON results, logs, and executables are ignored.
 
-Since asking non-windows users to properly install these libraries is essentially impossible, we bundle all the native libraries in the client releases. These are downloaded in the `Platform/runtimes/your_platform/native` folder (for example `runtimes/linux-arm64/native` for 64-bit arm linux) and the msbuild compilation process will automatically include them in the final executable folder. 
+## Switch sysmodule and settings application
 
-If you are planning to run the client on your own pc you can simply download the needed libraries from your package manager and run sysdvr without copying the binaries, the native folder is only the _preferred_ load location and if the client fails to find the libraries there it will fallback to the system path.
+These components are unchanged from upstream SysDVR and require the devkitA64 toolchain from devkitPro. Build each Switch project with its `Makefile`. For example, the USB-only sysmodule configuration is:
 
-The only exception is for CimguiSDL2Cross which must be self built since it is completely custom, you should be able to build it with cmake following the [instructions](https://github.com/exelix11/CimguiSDL2Cross/tree/master/cimgui#compilation) on the repo itself. You can use SysDVR without CimguiSDL2Cross if you run with the `--legacy` option but you will lose the GUI.
+```text
+make -j DEFINES="-DUSB_ONLY"
+```
 
-You can debug library loading issues by launching the client with the `--debug dynlib` argument.
+See the [upstream SysDVR repository](https://github.com/exelix11/SysDVR) for platform-specific packaging and broader project documentation.
 
-## Dependencies for Android
+## Other client platforms
 
-Android builds require the APK to include the native libraries, we use the android NDK preferred way of doing this by copying them to the `app/jni` folder, some are built from source while others are downloaded from github build feeds.
+RTX VSR is Windows-only. The upstream client still contains Linux, macOS, and Android targets, but this fork's RTX code is excluded from those platforms. Their build scripts remain under `Client/Platform`.

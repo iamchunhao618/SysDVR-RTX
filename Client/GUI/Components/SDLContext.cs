@@ -35,6 +35,9 @@ namespace SysDVR.Client.GUI.Components
 
         public bool IsFullscreen { get; private set; } = false;
         public Vector2 WindowSize { get; private set; }
+        internal Vector2 RendererPixelSize => PixelSize;
+        internal Vector2 RendererScale => WantedDPIScale;
+        internal bool UsingD3D11Renderer { get; private set; }
 
         internal bool AcceptControllerInput = true;
         internal bool DebugPrintSdlEvents = false;
@@ -74,6 +77,11 @@ namespace SysDVR.Client.GUI.Components
 
             SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_JOYSTICK).AssertZero(SDL_GetError);
 
+            SDL_GetVersion(out SDL_version runtimeVersion);
+            Console.WriteLine(
+                $"SDL runtime {runtimeVersion.major}.{runtimeVersion.minor}.{runtimeVersion.patch} " +
+                $"revision {SDL_GetRevision()}");
+
             var flags = SDL_image.IMG_InitFlags.IMG_INIT_JPG | SDL_image.IMG_InitFlags.IMG_INIT_PNG;
             SDL_image.IMG_Init(flags).AssertEqual((int)flags, SDL_image.IMG_GetError);
 
@@ -97,13 +105,35 @@ namespace SysDVR.Client.GUI.Components
                 SDL_WindowFlags.SDL_WINDOW_ALLOW_HIGHDPI | SDL_WindowFlags.SDL_WINDOW_RESIZABLE)
                 .AssertNotNull(SDL_GetError);
 
+            bool requestGpuDirect = Program.IsWindows &&
+                Program.Options.Windows_RtxVideo.Enabled &&
+                Program.Options.Windows_RtxVideo.PresentationBackend ==
+                    RtxVideoPresentationBackend.GpuDirectExperimental &&
+                !Program.Options.ForceSoftwareRenderer;
+            if (requestGpuDirect)
+            {
+                SDL_SetHint(SDL_HINT_RENDER_DRIVER, "direct3d11");
+                SDL_SetHint(SDL_HINT_RENDER_DIRECT3D_THREADSAFE, "1");
+                Console.WriteLine(
+                    "[RTX VSR] Requested SDL direct3d11 renderer for experimental GPU-direct presentation.");
+            }
+
             var flags = Program.Options.ForceSoftwareRenderer ? SDL_RendererFlags.SDL_RENDERER_SOFTWARE :
                 (SDL_RendererFlags.SDL_RENDERER_ACCELERATED | SDL_RendererFlags.SDL_RENDERER_PRESENTVSYNC);
 
             RendererHandle = SDL_CreateRenderer(WindowHandle, -1, flags).AssertNotNull(SDL_GetError);
 
             SDL_GetRendererInfo(RendererHandle, out var info);
-            Console.WriteLine($"Initialized SDL with {Marshal.PtrToStringAnsi(info.name)} renderer");
+            string rendererName = Marshal.PtrToStringAnsi(info.name) ?? "unknown";
+            UsingD3D11Renderer = string.Equals(
+                rendererName, "direct3d11", StringComparison.OrdinalIgnoreCase);
+            Console.WriteLine($"Initialized SDL with {rendererName} renderer");
+            if (requestGpuDirect && !UsingD3D11Renderer)
+            {
+                Console.WriteLine(
+                    "[RTX VSR] SDL did not create the requested direct3d11 renderer; " +
+                    "the CPU-readback path will remain available.");
+            }
 
             UpdateSize();
         }
@@ -260,6 +290,7 @@ namespace SysDVR.Client.GUI.Components
             {
                 SDL_DestroyRenderer(RendererHandle);
                 RendererHandle = IntPtr.Zero;
+                UsingD3D11Renderer = false;
             }
 
             if (WindowHandle != IntPtr.Zero)
