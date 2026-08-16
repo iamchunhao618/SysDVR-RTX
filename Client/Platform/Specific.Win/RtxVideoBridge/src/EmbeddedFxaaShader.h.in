@@ -1,0 +1,5 @@
+#pragma once
+
+static constexpr char kFxaaShaderSource[] = R"RVB_FXAA(
+@FXAA_SHADER_SOURCE@
+)RVB_FXAA";

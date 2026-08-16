@@ -19,7 +19,7 @@
 extern "C" {
 #endif
 
-#define RVB_API_VERSION 3u
+#define RVB_API_VERSION 4u
 #define RVB_INPUT_WIDTH 1280u
 #define RVB_INPUT_HEIGHT 720u
 #define RVB_OUTPUT_1080P_WIDTH 1920u
@@ -57,6 +57,13 @@ typedef enum RvbQuality
     RVB_QUALITY_HIGH = 3,
     RVB_QUALITY_ULTRA = 4
 } RvbQuality;
+
+typedef enum RvbPostAaMode
+{
+    RVB_POST_AA_OFF = 0,
+    RVB_POST_AA_FXAA = 1,
+    RVB_POST_AA_SMAA_1X = 2
+} RvbPostAaMode;
 
 typedef struct RvbProbeOptions
 {
@@ -120,6 +127,14 @@ typedef struct RvbFrameTiming
     double cpu_blocking_wait_ms;
     uint32_t direct_mode;
     uint32_t gpu_timing_latency_frames;
+    double fxaa_gpu_ms;
+    double smaa_edge_gpu_ms;
+    double smaa_blend_gpu_ms;
+    double smaa_neighborhood_gpu_ms;
+    double post_aa_gpu_ms;
+    uint32_t post_aa_requested;
+    uint32_t post_aa_applied;
+    uint32_t post_aa_failed;
 } RvbFrameTiming;
 
 #define RVB_ADAPTER_NAME_UTF8_SIZE 128u
@@ -147,6 +162,10 @@ typedef struct RvbDirectRenderOptions
     uint32_t target_width;
     uint32_t target_height;
     uint32_t rotation_quarter_turns;
+    uint32_t post_aa_mode;
+    float fxaa_subpixel;
+    float fxaa_edge_threshold;
+    float fxaa_edge_threshold_min;
 } RvbDirectRenderOptions;
 
 typedef struct RvbHandle RvbHandle;

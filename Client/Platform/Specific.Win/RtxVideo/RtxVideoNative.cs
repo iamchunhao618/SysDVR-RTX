@@ -109,6 +109,14 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
         public double CpuBlockingWaitMilliseconds;
         public uint DirectMode;
         public uint GpuTimingLatencyFrames;
+        public double FxaaGpuMilliseconds;
+        public double SmaaEdgeGpuMilliseconds;
+        public double SmaaBlendGpuMilliseconds;
+        public double SmaaNeighborhoodGpuMilliseconds;
+        public double PostAaGpuMilliseconds;
+        public uint PostAaRequested;
+        public uint PostAaApplied;
+        public uint PostAaFailed;
     }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
@@ -154,6 +162,10 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
         public uint TargetWidth;
         public uint TargetHeight;
         public uint RotationQuarterTurns;
+        public uint PostAaMode;
+        public float FxaaSubpixel;
+        public float FxaaEdgeThreshold;
+        public float FxaaEdgeThresholdMin;
     }
 
     internal readonly record struct RtxVideoOutputSize(uint Width, uint Height)
@@ -216,7 +228,7 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
 
     internal sealed unsafe class RtxVideoNative : IDisposable
     {
-        public const uint ApiVersion = 3;
+        public const uint ApiVersion = 4;
         public const uint InputWidth = 1280;
         public const uint InputHeight = 720;
 

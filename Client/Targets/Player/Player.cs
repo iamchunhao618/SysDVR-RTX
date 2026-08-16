@@ -184,7 +184,10 @@ namespace SysDVR.Client.Targets.Player
         RtxVideoQuality LastRtxQuality = RtxVideoQuality.Medium;
         RtxVideoOutputResolution LastRtxResolution =
             RtxVideoOutputResolution.QuadHd1440p;
+        RtxVideoPostProcessAa LastRtxPostAa = RtxVideoPostProcessAa.Off;
         bool GpuDirectUnavailable;
+        bool PostAaCpuFallbackReported;
+        bool PostAaFailureReported;
         bool GpuDirectFrameReady;
         long GpuDirectFrameAvailableTimestamp;
         readonly string? ComparisonCaptureDirectory =
@@ -369,6 +372,7 @@ namespace SysDVR.Client.Targets.Player
 
             LastRtxQuality = quality;
             LastRtxResolution = resolution;
+            LastRtxPostAa = Program.Options.Windows_RtxVideo.PostProcessAa;
             for (int attempt = 0; attempt < 2; ++attempt)
             {
                 if (RtxEnhancer is not null &&
@@ -439,13 +443,21 @@ namespace SysDVR.Client.Targets.Player
                     double pathMilliseconds = Stopwatch.GetElapsedTime(
                         frameAvailableTimestamp).TotalMilliseconds;
                     RtxTelemetry.BeginFrame(
-                        quality, resolution, frameTiming,
+                        quality, resolution, LastRtxPostAa, frameTiming,
                         decodeReceiveMilliseconds,
                         uploadMilliseconds,
                         pathMilliseconds,
                         frameAvailableTimestamp);
                     if (!RtxEnhancer.IsGpuDirect)
                     {
+                        if (LastRtxPostAa != RtxVideoPostProcessAa.Off &&
+                            !PostAaCpuFallbackReported)
+                        {
+                            PostAaCpuFallbackReported = true;
+                            Console.WriteLine(
+                                "[RTX VSR] Post-process AA requires GPU direct; " +
+                                "continuing CPU-readback VSR with AA Off.");
+                        }
                         TryCaptureComparison(
                             RtxTexture,
                             $"vsr_{RtxEnhancer.OutputHeight}p_{quality.ToString().ToLowerInvariant()}");
@@ -508,6 +520,10 @@ namespace SysDVR.Client.Targets.Player
                     TargetWidth = checked((uint)pixelSize.X),
                     TargetHeight = checked((uint)pixelSize.Y),
                     RotationQuarterTurns = checked((uint)rotationQuarterTurns),
+                    PostAaMode = (uint)Program.Options.Windows_RtxVideo.PostProcessAa,
+                    FxaaSubpixel = 0.50f,
+                    FxaaEdgeThreshold = 1.0f / 6.0f,
+                    FxaaEdgeThresholdMin = 1.0f / 12.0f,
                 };
                 if (!RtxEnhancer.TryRenderGpuDirect(
                     renderOptions, out RtxVideoNativeFrameTiming nativeTiming))
@@ -518,6 +534,13 @@ namespace SysDVR.Client.Targets.Player
 
                 submissionMilliseconds = Stopwatch.GetElapsedTime(
                     submissionStart).TotalMilliseconds;
+                if (nativeTiming.PostAaFailed != 0 && !PostAaFailureReported)
+                {
+                    PostAaFailureReported = true;
+                    Console.WriteLine(
+                        "[RTX VSR] Selected post-AA failed and was disabled; " +
+                        "GPU-direct VSR remains active with AA Off.");
+                }
                 double enhancementMilliseconds = Stopwatch.GetElapsedTime(
                     GpuDirectFrameAvailableTimestamp).TotalMilliseconds;
                 RecordVideoRenderSubmission(
@@ -638,7 +661,8 @@ namespace SysDVR.Client.Targets.Player
                 string path = Path.Combine(
                     ComparisonCaptureDirectory,
                     $"vsr_{RtxEnhancer.OutputHeight}p_" +
-                    $"{LastRtxQuality.ToString().ToLowerInvariant()}_gpu_direct.png");
+                    $"{LastRtxQuality.ToString().ToLowerInvariant()}_" +
+                    $"{LastRtxPostAa.ToString().ToLowerInvariant()}_gpu_direct.png");
                 using SDLCapture capture = CaptureCurrentFrame();
                 SDLCapture.Export(capture, path);
                 Console.WriteLine(

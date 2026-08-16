@@ -48,6 +48,13 @@ namespace SysDVR.Client.Core
         GpuDirectExperimental = 1,
     }
 
+    public enum RtxVideoPostProcessAa
+    {
+        Off = 0,
+        Fxaa = 1,
+        Smaa1x = 2,
+    }
+
     public class RtxVideoOptions
     {
         public bool Enabled = false;
@@ -56,6 +63,8 @@ namespace SysDVR.Client.Core
         public RtxVideoQuality Quality = RtxVideoQuality.Medium;
         public RtxVideoPresentationBackend PresentationBackend =
             RtxVideoPresentationBackend.CpuReadback;
+        public RtxVideoPostProcessAa PostProcessAa =
+            RtxVideoPostProcessAa.Off;
     }
 
     public class Options

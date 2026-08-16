@@ -362,6 +362,7 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
         {
             public required RtxVideoQuality Quality { get; init; }
             public required RtxVideoOutputResolution Resolution { get; init; }
+            public required RtxVideoPostProcessAa PostAa { get; init; }
             public required RtxVideoFrameTiming Timing { get; set; }
             public required double DecodeReceiveMilliseconds { get; init; }
             public required double SdlUploadMilliseconds { get; init; }
@@ -387,6 +388,11 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
         private readonly List<double> _queryResolve = new(ReportingInterval);
         private readonly List<double> _directDrawSubmitCpu = new(ReportingInterval);
         private readonly List<double> _directDrawGpu = new(ReportingInterval);
+        private readonly List<double> _fxaaGpu = new(ReportingInterval);
+        private readonly List<double> _smaaEdgeGpu = new(ReportingInterval);
+        private readonly List<double> _smaaBlendGpu = new(ReportingInterval);
+        private readonly List<double> _smaaNeighborhoodGpu = new(ReportingInterval);
+        private readonly List<double> _postAaGpu = new(ReportingInterval);
         private readonly List<double> _cpuBlockingWait = new(ReportingInterval);
         private readonly List<double> _gpuTimingLatencyFrames = new(ReportingInterval);
         private readonly List<double> _sdlUpload = new(ReportingInterval);
@@ -399,6 +405,7 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
         private readonly List<double> _frameInterval = new(ReportingInterval);
         private RtxVideoQuality? _activeQuality;
         private RtxVideoOutputResolution? _activeResolution;
+        private RtxVideoPostProcessAa? _activePostAa;
         private PendingFrame? _pending;
         private long _lastPresentedTimestamp;
         private int _warmupRemaining;
@@ -406,6 +413,7 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
         public void BeginFrame(
             RtxVideoQuality quality,
             RtxVideoOutputResolution resolution,
+            RtxVideoPostProcessAa postAa,
             RtxVideoFrameTiming frame,
             double decodeReceiveMilliseconds,
             double sdlUploadMilliseconds,
@@ -414,21 +422,28 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
         {
             bool configurationChanged = !_activeQuality.HasValue ||
                 _activeQuality.Value != quality ||
-                _activeResolution != resolution;
+                _activeResolution != resolution ||
+                _activePostAa != postAa;
             if (configurationChanged)
             {
                 if (_activeQuality.HasValue && _conversion.Count != 0)
-                    Log(_activeQuality.Value, _activeResolution!.Value, true);
+                    Log(
+                        _activeQuality.Value,
+                        _activeResolution!.Value,
+                        _activePostAa ?? RtxVideoPostProcessAa.Off,
+                        true);
                 ResetSamples();
                 _warmupRemaining = WarmupFrames;
             }
             _activeQuality = quality;
             _activeResolution = resolution;
+            _activePostAa = postAa;
 
             _pending = new PendingFrame
             {
                 Quality = quality,
                 Resolution = resolution,
+                PostAa = postAa,
                 Timing = frame,
                 DecodeReceiveMilliseconds = decodeReceiveMilliseconds,
                 SdlUploadMilliseconds = sdlUploadMilliseconds,
@@ -496,6 +511,12 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
             _directDrawSubmitCpu.Add(native.DirectDrawSubmitCpuMilliseconds);
             _directDrawGpu.Add(
                 gpuTimingValid ? native.DirectDrawGpuMilliseconds : double.NaN);
+            _fxaaGpu.Add(gpuTimingValid ? native.FxaaGpuMilliseconds : double.NaN);
+            _smaaEdgeGpu.Add(gpuTimingValid ? native.SmaaEdgeGpuMilliseconds : double.NaN);
+            _smaaBlendGpu.Add(gpuTimingValid ? native.SmaaBlendGpuMilliseconds : double.NaN);
+            _smaaNeighborhoodGpu.Add(
+                gpuTimingValid ? native.SmaaNeighborhoodGpuMilliseconds : double.NaN);
+            _postAaGpu.Add(gpuTimingValid ? native.PostAaGpuMilliseconds : double.NaN);
             _cpuBlockingWait.Add(native.CpuBlockingWaitMilliseconds);
             _gpuTimingLatencyFrames.Add(
                 gpuTimingValid ? native.GpuTimingLatencyFrames : double.NaN);
@@ -519,7 +540,7 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
 
             if (_conversion.Count == ReportingInterval)
             {
-                Log(pending.Quality, pending.Resolution, false);
+                Log(pending.Quality, pending.Resolution, pending.PostAa, false);
                 ResetSamples();
             }
         }
@@ -534,10 +555,12 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
                 Log(
                     _activeQuality ?? quality,
                     _activeResolution ?? resolution,
+                    _activePostAa ?? RtxVideoPostProcessAa.Off,
                     true);
                 ResetSamples();
                 _activeQuality = null;
                 _activeResolution = null;
+                _activePostAa = null;
             }
             _lastPresentedTimestamp = 0;
         }
@@ -545,6 +568,7 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
         private void Log(
             RtxVideoQuality quality,
             RtxVideoOutputResolution resolution,
+            RtxVideoPostProcessAa postAa,
             bool final)
         {
             string kind = final ? "final" : "interval";
@@ -552,6 +576,7 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
             Console.WriteLine(
                 $"[RTX VSR timing/{kind}] output={size.Width}x{size.Height} " +
                 $"quality={quality} warmup={WarmupFrames} frames={_conversion.Count}; " +
+                $"post_aa={postAa} " +
                 $"decode_receive[{Describe(_decodeReceive)}] " +
                 $"convert[{Describe(_conversion)}] " +
                 $"bridge_host[{Describe(_bridgeHost)}] " +
@@ -569,6 +594,11 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
                 $"query_resolve[{Describe(_queryResolve)}] " +
                 $"direct_draw_submit_cpu[{Describe(_directDrawSubmitCpu)}] " +
                 $"direct_draw_gpu[{Describe(_directDrawGpu)}] " +
+                $"fxaa_gpu[{Describe(_fxaaGpu)}] " +
+                $"smaa_edge_gpu[{Describe(_smaaEdgeGpu)}] " +
+                $"smaa_blend_gpu[{Describe(_smaaBlendGpu)}] " +
+                $"smaa_neighborhood_gpu[{Describe(_smaaNeighborhoodGpu)}] " +
+                $"post_aa_gpu[{Describe(_postAaGpu)}] " +
                 $"cpu_blocking_wait[{Describe(_cpuBlockingWait)}] " +
                 $"gpu_timing_latency_frames[{Describe(_gpuTimingLatencyFrames)}] " +
                 $"sdl_upload[{Describe(_sdlUpload)}] " +
@@ -626,6 +656,11 @@ namespace SysDVR.Client.Platform.Specific.Win.RtxVideo
             _queryResolve.Clear();
             _directDrawSubmitCpu.Clear();
             _directDrawGpu.Clear();
+            _fxaaGpu.Clear();
+            _smaaEdgeGpu.Clear();
+            _smaaBlendGpu.Clear();
+            _smaaNeighborhoodGpu.Clear();
+            _postAaGpu.Clear();
             _cpuBlockingWait.Clear();
             _gpuTimingLatencyFrames.Clear();
             _sdlUpload.Clear();

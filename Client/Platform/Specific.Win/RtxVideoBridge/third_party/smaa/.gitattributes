@@ -1,0 +1,3 @@
+# Preserve canonical upstream formatting and byte-for-byte lookup headers.
+SMAA.hlsl whitespace=-trailing-space
+Textures/*.h whitespace=-trailing-space

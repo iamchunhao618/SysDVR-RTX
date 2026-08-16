@@ -1,0 +1,75 @@
+#pragma once
+
+static constexpr char kSmaaShaderSource[] = R"RVB_SMAA(
+#define SMAA_HLSL_4 1
+#define SMAA_PRESET_HIGH 1
+cbuffer SmaaConstants : register(b0) { float4 RvbSmaaRtMetrics; };
+#define SMAA_RT_METRICS RvbSmaaRtMetrics
+
+@SMAA_REFERENCE_SOURCE@
+
+Texture2D colorTex : register(t0);
+Texture2D edgesTex : register(t0);
+Texture2D areaTex : register(t1);
+Texture2D searchTex : register(t2);
+Texture2D blendTex : register(t1);
+
+struct EdgeVertex { float4 position : SV_POSITION; float2 texcoord : TEXCOORD0; float4 offset[3] : TEXCOORD1; };
+struct WeightVertex { float4 position : SV_POSITION; float2 texcoord : TEXCOORD0; float2 pixcoord : TEXCOORD1; float4 offset[3] : TEXCOORD2; };
+struct NeighborhoodVertex { float4 position : SV_POSITION; float2 texcoord : TEXCOORD0; float4 offset : TEXCOORD1; };
+
+float2 RvbFullscreenUv(uint vertexId)
+{
+    return float2((vertexId << 1) & 2, vertexId & 2);
+}
+
+float4 RvbFullscreenPosition(float2 uv)
+{
+    return float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+}
+
+EdgeVertex SmaaEdgeVS(uint vertexId : SV_VertexID)
+{
+    EdgeVertex output;
+    output.texcoord = RvbFullscreenUv(vertexId);
+    output.position = RvbFullscreenPosition(output.texcoord);
+    SMAAEdgeDetectionVS(output.texcoord, output.offset);
+    return output;
+}
+
+float2 SmaaEdgePS(EdgeVertex input) : SV_TARGET
+{
+    return SMAALumaEdgeDetectionPS(input.texcoord, input.offset, colorTex);
+}
+
+WeightVertex SmaaWeightVS(uint vertexId : SV_VertexID)
+{
+    WeightVertex output;
+    output.texcoord = RvbFullscreenUv(vertexId);
+    output.position = RvbFullscreenPosition(output.texcoord);
+    SMAABlendingWeightCalculationVS(output.texcoord, output.pixcoord, output.offset);
+    return output;
+}
+
+float4 SmaaWeightPS(WeightVertex input) : SV_TARGET
+{
+    return SMAABlendingWeightCalculationPS(
+        input.texcoord, input.pixcoord, input.offset,
+        edgesTex, areaTex, searchTex, float4(0.0, 0.0, 0.0, 0.0));
+}
+
+NeighborhoodVertex SmaaNeighborhoodVS(uint vertexId : SV_VertexID)
+{
+    NeighborhoodVertex output;
+    output.texcoord = RvbFullscreenUv(vertexId);
+    output.position = RvbFullscreenPosition(output.texcoord);
+    SMAANeighborhoodBlendingVS(output.texcoord, output.offset);
+    return output;
+}
+
+float4 SmaaNeighborhoodPS(NeighborhoodVertex input) : SV_TARGET
+{
+    return SMAANeighborhoodBlendingPS(
+        input.texcoord, input.offset, colorTex, blendTex);
+}
+)RVB_SMAA";

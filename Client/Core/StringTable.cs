@@ -208,6 +208,11 @@ namespace SysDVR.Client.Core
 			public string RtxVideoPresentationBackend = "RTX VSR presentation path";
 			public string RtxVideoBackendCpu = "CPU readback (compatible)";
 			public string RtxVideoBackendGpu = "GPU direct (experimental, restart required)";
+			public string RtxVideoPostProcessAa = "Post-process anti-aliasing";
+			public string RtxVideoAaOff = "Off";
+			public string RtxVideoAaFxaa = "FXAA";
+			public string RtxVideoAaSmaa = "SMAA 1x";
+			public string RtxVideoAaGpuDirectOnly = "Post-AA affects Switch video only and requires the GPU-direct presentation path.";
 			public string RtxVideoOutput = "The NVIDIA RTX Video SDK directly produces the selected output size.";
 			public string RtxVideoStatus = "RTX VSR status: {0}";
 			

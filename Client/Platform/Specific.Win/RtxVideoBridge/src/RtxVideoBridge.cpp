@@ -1,8 +1,10 @@
 #include "RtxVideoBridge.h"
+#include "PostProcessAA.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -834,7 +836,8 @@ public:
         if (options.target_width == 0 || options.target_height == 0 ||
             options.destination_width <= 0.0f ||
             options.destination_height <= 0.0f ||
-            options.rotation_quarter_turns > 3u)
+            options.rotation_quarter_turns > 3u ||
+            options.post_aa_mode > RVB_POST_AA_SMAA_1X)
         {
             throw BridgeError(
                 RVB_STATUS_INVALID_ARGUMENT,
@@ -866,12 +869,79 @@ public:
                 "SDL render-target size changed during GPU-direct presentation");
         }
 
+        directPendingTiming_.post_aa_requested = options.post_aa_mode;
+        directPendingTiming_.post_aa_applied = RVB_POST_AA_OFF;
+        directPendingTiming_.post_aa_failed = 0u;
+        rvb::PostAaOutput aaOutput{
+            outputTexture_.Get(), outputShaderResource_.Get()};
         const auto drawStart = Clock::now();
         {
             MultithreadGuard multithreadGuard(multithread_.Get());
             ContextStateGuard stateGuard(context1_.Get(), bridgeContextState_.Get());
-            DrawOutput(renderTarget.Get(), options);
+            const auto requestedMode =
+                static_cast<rvb::PostAaMode>(options.post_aa_mode);
+            rvb::PostAaMode appliedMode = requestedMode;
+            const std::uint32_t modeBit = 1u << options.post_aa_mode;
+            if ((disabledPostAaModes_ & modeBit) != 0u)
+            {
+                appliedMode = rvb::PostAaMode::Off;
+                directPendingTiming_.post_aa_failed = 1u;
+            }
+
+            const rvb::PostAaQueries queries = ActivePostAaQueries();
+            try
+            {
+                if (appliedMode == rvb::PostAaMode::Off)
+                {
+                    if (queries.edge != nullptr) context_->End(queries.edge);
+                    if (queries.blend != nullptr) context_->End(queries.blend);
+                    if (queries.neighborhood != nullptr)
+                        context_->End(queries.neighborhood);
+                }
+                else
+                {
+                    if (postProcessAa_ == nullptr)
+                    {
+                        postProcessAa_ = std::make_unique<rvb::PostProcessAA>(
+                            device_.Get(), context_.Get());
+                    }
+                    aaOutput = postProcessAa_->Apply(
+                        appliedMode,
+                        outputTexture_.Get(),
+                        outputShaderResource_.Get(),
+                        outputWidth_, outputHeight_,
+                        {
+                            options.fxaa_subpixel,
+                            options.fxaa_edge_threshold,
+                            options.fxaa_edge_threshold_min,
+                        },
+                        queries);
+                }
+                directPendingTiming_.post_aa_applied =
+                    static_cast<std::uint32_t>(appliedMode);
+            }
+            catch (const std::exception& error)
+            {
+                ThrowIfDeviceLost("post-process AA");
+                disabledPostAaModes_ |= modeBit;
+                directPendingTiming_.post_aa_failed = 1u;
+                directPendingTiming_.post_aa_applied = RVB_POST_AA_OFF;
+                postAaLastError_ = error.what();
+                const std::string message =
+                    "[RTX VSR] Post-AA disabled; continuing GPU-direct VSR without AA: " +
+                    postAaLastError_ + "\n";
+                std::fputs(message.c_str(), stderr);
+                OutputDebugStringA(message.c_str());
+                if (queries.edge != nullptr) context_->End(queries.edge);
+                if (queries.blend != nullptr) context_->End(queries.blend);
+                if (queries.neighborhood != nullptr)
+                    context_->End(queries.neighborhood);
+            }
+
+            DrawOutput(
+                renderTarget.Get(), aaOutput.shaderResource, options);
         }
+        screenshotSource_ = aaOutput.texture;
         directPendingTiming_.direct_draw_submit_cpu_ms =
             Milliseconds(Clock::now() - drawStart);
 
@@ -882,6 +952,9 @@ public:
             context_->End(query.disjoint.Get());
             query.pending = true;
             query.sequence = ++directSequence_;
+            query.postAaRequested = directPendingTiming_.post_aa_requested;
+            query.postAaApplied = directPendingTiming_.post_aa_applied;
+            query.postAaFailed = directPendingTiming_.post_aa_failed;
             activeDirectQuery_ = -1;
         }
 
@@ -909,7 +982,11 @@ public:
         ContextStateGuard stateGuard(
             externalDevice_ ? context1_.Get() : nullptr,
             externalDevice_ ? bridgeContextState_.Get() : nullptr);
-        context_->CopyResource(stagingTexture_.Get(), outputTexture_.Get());
+        ID3D11Texture2D* screenshotSource =
+            screenshotSource_ != nullptr
+                ? screenshotSource_.Get()
+                : outputTexture_.Get();
+        context_->CopyResource(stagingTexture_.Get(), screenshotSource);
         D3D11_MAPPED_SUBRESOURCE mapped{};
         CheckHr(
             context_->Map(stagingTexture_.Get(), 0, D3D11_MAP_READ, 0, &mapped),
@@ -940,6 +1017,8 @@ public:
         outputWidth_ = outputWidth;
         outputHeight_ = outputHeight;
         CreateOutputTextures();
+        if (postProcessAa_ != nullptr)
+            postProcessAa_->ResetSize();
     }
 
     const AdapterInfo& Adapter() const { return selectedAdapter_; }
@@ -1064,6 +1143,7 @@ private:
                 device_->CreateShaderResourceView(
                     outputTexture_.Get(), nullptr, &outputShaderResource_),
                 "ID3D11Device::CreateShaderResourceView(VSR output)");
+            screenshotSource_ = outputTexture_;
         }
     }
 
@@ -1104,9 +1184,15 @@ private:
         ComPtr<ID3D11Query> start;
         ComPtr<ID3D11Query> upload;
         ComPtr<ID3D11Query> evaluate;
+        ComPtr<ID3D11Query> aaEdge;
+        ComPtr<ID3D11Query> aaBlend;
+        ComPtr<ID3D11Query> aaNeighborhood;
         ComPtr<ID3D11Query> draw;
         bool pending = false;
         std::uint64_t sequence = 0;
+        std::uint32_t postAaRequested = RVB_POST_AA_OFF;
+        std::uint32_t postAaApplied = RVB_POST_AA_OFF;
+        std::uint32_t postAaFailed = 0;
     };
 
     void CreateDirectResources()
@@ -1240,6 +1326,15 @@ float4 PixelMain(PixelInput input) : SV_TARGET
                 device_->CreateQuery(&queryDescription, &query.evaluate),
                 "ID3D11Device::CreateQuery(gpu-direct evaluate)");
             CheckHr(
+                device_->CreateQuery(&queryDescription, &query.aaEdge),
+                "ID3D11Device::CreateQuery(gpu-direct AA edge)");
+            CheckHr(
+                device_->CreateQuery(&queryDescription, &query.aaBlend),
+                "ID3D11Device::CreateQuery(gpu-direct AA blend)");
+            CheckHr(
+                device_->CreateQuery(&queryDescription, &query.aaNeighborhood),
+                "ID3D11Device::CreateQuery(gpu-direct AA neighborhood)");
+            CheckHr(
                 device_->CreateQuery(&queryDescription, &query.draw),
                 "ID3D11Device::CreateQuery(gpu-direct draw)");
         }
@@ -1247,6 +1342,7 @@ float4 PixelMain(PixelInput input) : SV_TARGET
 
     void DrawOutput(
         ID3D11RenderTargetView* renderTarget,
+        ID3D11ShaderResourceView* source,
         const RvbDirectRenderOptions& options)
     {
         const float left = options.destination_x;
@@ -1321,7 +1417,7 @@ float4 PixelMain(PixelInput input) : SV_TARGET
         context_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         context_->VSSetShader(directVertexShader_.Get(), nullptr, 0);
         context_->PSSetShader(directPixelShader_.Get(), nullptr, 0);
-        ID3D11ShaderResourceView* shaderResource = outputShaderResource_.Get();
+        ID3D11ShaderResourceView* shaderResource = source;
         context_->PSSetShaderResources(0, 1, &shaderResource);
         ID3D11SamplerState* sampler = directSampler_.Get();
         context_->PSSetSamplers(0, 1, &sampler);
@@ -1354,10 +1450,25 @@ float4 PixelMain(PixelInput input) : SV_TARGET
             return;
         }
         DirectQuerySet& query = directQueries_[activeDirectQuery_];
+        context_->End(query.aaEdge.Get());
+        context_->End(query.aaBlend.Get());
+        context_->End(query.aaNeighborhood.Get());
         context_->End(query.draw.Get());
         context_->End(query.disjoint.Get());
         query.pending = false;
         activeDirectQuery_ = -1;
+    }
+
+    rvb::PostAaQueries ActivePostAaQueries() const noexcept
+    {
+        if (activeDirectQuery_ < 0)
+            return {};
+        const DirectQuerySet& query = directQueries_[activeDirectQuery_];
+        return {
+            query.aaEdge.Get(),
+            query.aaBlend.Get(),
+            query.aaNeighborhood.Get(),
+        };
     }
 
     void ResolveDirectQueries(
@@ -1384,6 +1495,9 @@ float4 PixelMain(PixelInput input) : SV_TARGET
             UINT64 timestampStart = 0;
             UINT64 timestampUpload = 0;
             UINT64 timestampEvaluate = 0;
+            UINT64 timestampAaEdge = 0;
+            UINT64 timestampAaBlend = 0;
+            UINT64 timestampAaNeighborhood = 0;
             UINT64 timestampDraw = 0;
             const HRESULT timestampResults[] = {
                 context_->GetData(
@@ -1395,6 +1509,15 @@ float4 PixelMain(PixelInput input) : SV_TARGET
                 context_->GetData(
                     query.evaluate.Get(), &timestampEvaluate,
                     sizeof(timestampEvaluate), D3D11_ASYNC_GETDATA_DONOTFLUSH),
+                context_->GetData(
+                    query.aaEdge.Get(), &timestampAaEdge,
+                    sizeof(timestampAaEdge), D3D11_ASYNC_GETDATA_DONOTFLUSH),
+                context_->GetData(
+                    query.aaBlend.Get(), &timestampAaBlend,
+                    sizeof(timestampAaBlend), D3D11_ASYNC_GETDATA_DONOTFLUSH),
+                context_->GetData(
+                    query.aaNeighborhood.Get(), &timestampAaNeighborhood,
+                    sizeof(timestampAaNeighborhood), D3D11_ASYNC_GETDATA_DONOTFLUSH),
                 context_->GetData(
                     query.draw.Get(), &timestampDraw, sizeof(timestampDraw),
                     D3D11_ASYNC_GETDATA_DONOTFLUSH),
@@ -1426,8 +1549,27 @@ float4 PixelMain(PixelInput input) : SV_TARGET
                     static_cast<double>(timestampUpload - timestampStart) * scale;
                 lastDirectGpuTiming_.evaluate_gpu_ms =
                     static_cast<double>(timestampEvaluate - timestampUpload) * scale;
+                lastDirectGpuTiming_.post_aa_requested = query.postAaRequested;
+                lastDirectGpuTiming_.post_aa_applied = query.postAaApplied;
+                lastDirectGpuTiming_.post_aa_failed = query.postAaFailed;
+                if (query.postAaApplied == RVB_POST_AA_FXAA)
+                {
+                    lastDirectGpuTiming_.fxaa_gpu_ms =
+                        static_cast<double>(timestampAaEdge - timestampEvaluate) * scale;
+                }
+                else if (query.postAaApplied == RVB_POST_AA_SMAA_1X)
+                {
+                    lastDirectGpuTiming_.smaa_edge_gpu_ms =
+                        static_cast<double>(timestampAaEdge - timestampEvaluate) * scale;
+                    lastDirectGpuTiming_.smaa_blend_gpu_ms =
+                        static_cast<double>(timestampAaBlend - timestampAaEdge) * scale;
+                    lastDirectGpuTiming_.smaa_neighborhood_gpu_ms =
+                        static_cast<double>(timestampAaNeighborhood - timestampAaBlend) * scale;
+                }
+                lastDirectGpuTiming_.post_aa_gpu_ms =
+                    static_cast<double>(timestampAaNeighborhood - timestampEvaluate) * scale;
                 lastDirectGpuTiming_.direct_draw_gpu_ms =
-                    static_cast<double>(timestampDraw - timestampEvaluate) * scale;
+                    static_cast<double>(timestampDraw - timestampAaNeighborhood) * scale;
                 lastDirectGpuTiming_.total_gpu_ms =
                     static_cast<double>(timestampDraw - timestampStart) * scale;
                 const std::uint64_t observationSequence =
@@ -1454,6 +1596,15 @@ float4 PixelMain(PixelInput input) : SV_TARGET
         timing.upload_gpu_ms = lastDirectGpuTiming_.upload_gpu_ms;
         timing.evaluate_gpu_ms = lastDirectGpuTiming_.evaluate_gpu_ms;
         timing.direct_draw_gpu_ms = lastDirectGpuTiming_.direct_draw_gpu_ms;
+        timing.fxaa_gpu_ms = lastDirectGpuTiming_.fxaa_gpu_ms;
+        timing.smaa_edge_gpu_ms = lastDirectGpuTiming_.smaa_edge_gpu_ms;
+        timing.smaa_blend_gpu_ms = lastDirectGpuTiming_.smaa_blend_gpu_ms;
+        timing.smaa_neighborhood_gpu_ms =
+            lastDirectGpuTiming_.smaa_neighborhood_gpu_ms;
+        timing.post_aa_gpu_ms = lastDirectGpuTiming_.post_aa_gpu_ms;
+        timing.post_aa_requested = lastDirectGpuTiming_.post_aa_requested;
+        timing.post_aa_applied = lastDirectGpuTiming_.post_aa_applied;
+        timing.post_aa_failed = lastDirectGpuTiming_.post_aa_failed;
         timing.total_gpu_ms = lastDirectGpuTiming_.total_gpu_ms;
         timing.gpu_timing_latency_frames =
             lastDirectGpuTiming_.gpu_timing_latency_frames;
@@ -1668,6 +1819,10 @@ float4 PixelMain(PixelInput input) : SV_TARGET
         directPendingTiming_ = {};
         lastDirectGpuTiming_ = {};
         lastDirectGpuTimingValid_ = false;
+        screenshotSource_.Reset();
+        postProcessAa_.reset();
+        disabledPostAaModes_ = 0;
+        postAaLastError_.clear();
         directSampler_.Reset();
         directVertexBuffer_.Reset();
         directInputLayout_.Reset();
@@ -1703,12 +1858,16 @@ float4 PixelMain(PixelInput input) : SV_TARGET
     ComPtr<ID3D11Texture2D> inputTexture_;
     ComPtr<ID3D11Texture2D> outputTexture_;
     ComPtr<ID3D11ShaderResourceView> outputShaderResource_;
+    ComPtr<ID3D11Texture2D> screenshotSource_;
     ComPtr<ID3D11Texture2D> stagingTexture_;
     ComPtr<ID3D11VertexShader> directVertexShader_;
     ComPtr<ID3D11PixelShader> directPixelShader_;
     ComPtr<ID3D11InputLayout> directInputLayout_;
     ComPtr<ID3D11Buffer> directVertexBuffer_;
     ComPtr<ID3D11SamplerState> directSampler_;
+    std::unique_ptr<rvb::PostProcessAA> postProcessAa_;
+    std::uint32_t disabledPostAaModes_ = 0;
+    std::string postAaLastError_;
     std::array<DirectQuerySet, 4> directQueries_{};
     int activeDirectQuery_ = -1;
     std::size_t directQueryCursor_ = 0;

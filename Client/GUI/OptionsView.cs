@@ -205,6 +205,16 @@ namespace SysDVR.Client.GUI
 			Program.Options.Windows_RtxVideo.PresentationBackend
 		);
 
+		readonly ComboEnum<RtxVideoPostProcessAa> RtxVideoPostProcessAaModes = new(
+			Program.Strings.Settings.RtxVideoPostProcessAa,
+			[
+				new(Program.Strings.Settings.RtxVideoAaOff, RtxVideoPostProcessAa.Off),
+				new(Program.Strings.Settings.RtxVideoAaFxaa, RtxVideoPostProcessAa.Fxaa),
+				new(Program.Strings.Settings.RtxVideoAaSmaa, RtxVideoPostProcessAa.Smaa1x)
+			],
+			Program.Options.Windows_RtxVideo.PostProcessAa
+		);
+
 		readonly PathInputPopup PathInput = new();
 		readonly Gui.Popup ErrorPopup = new(Program.Strings.General.PopupErrorTitle);
 		string SettingsErrorMessage = "";
@@ -351,6 +361,10 @@ namespace SysDVR.Client.GUI
 						RtxVideoOutputResolutions.Draw(
 							ref Program.Options.Windows_RtxVideo.OutputResolution);
 						RtxVideoQualities.Draw(ref Program.Options.Windows_RtxVideo.Quality);
+						RtxVideoPostProcessAaModes.Draw(
+							ref Program.Options.Windows_RtxVideo.PostProcessAa);
+						if (Program.Options.Windows_RtxVideo.PostProcessAa != RtxVideoPostProcessAa.Off)
+							ImGui.TextWrapped(Strings.RtxVideoAaGpuDirectOnly);
 						ImGui.TextWrapped(Strings.RtxVideoOutput);
 						ImGui.TextWrapped(string.Format(Strings.RtxVideoStatus, RtxVideoSupport.Status));
 					}
