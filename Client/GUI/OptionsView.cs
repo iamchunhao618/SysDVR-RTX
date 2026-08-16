@@ -2,6 +2,7 @@
 using SysDVR.Client.App;
 using SysDVR.Client.Core;
 using SysDVR.Client.Platform;
+using SysDVR.Client.Platform.Specific.Win.RtxVideo;
 using SysDVR.Client.Targets.Player;
 using System;
 using System.Collections.Generic;
@@ -175,6 +176,26 @@ namespace SysDVR.Client.GUI
 			.ToArray(), 
 		Program.Options.PreferredLanguage);
 
+		readonly ComboEnum<RtxVideoQuality> RtxVideoQualities = new(Program.Strings.Settings.RtxVideoQuality,
+			[
+				new(Program.Strings.Settings.RtxVideoQualityLow, RtxVideoQuality.Low),
+				new(Program.Strings.Settings.RtxVideoQualityMedium, RtxVideoQuality.Medium),
+				new(Program.Strings.Settings.RtxVideoQualityHigh, RtxVideoQuality.High),
+				new(Program.Strings.Settings.RtxVideoQualityUltra, RtxVideoQuality.Ultra)
+			],
+			Program.Options.Windows_RtxVideo.Quality
+		);
+
+		readonly ComboEnum<RtxVideoOutputResolution> RtxVideoOutputResolutions = new(
+			Program.Strings.Settings.RtxVideoOutputResolution,
+			[
+				new(Program.Strings.Settings.RtxVideoOutput1080p, RtxVideoOutputResolution.FullHd1080p),
+				new(Program.Strings.Settings.RtxVideoOutput1440p, RtxVideoOutputResolution.QuadHd1440p),
+				new(Program.Strings.Settings.RtxVideoOutput2160p, RtxVideoOutputResolution.UltraHd2160p)
+			],
+			Program.Options.Windows_RtxVideo.OutputResolution
+		);
+
 		readonly PathInputPopup PathInput = new();
 		readonly Gui.Popup ErrorPopup = new(Program.Strings.General.PopupErrorTitle);
 		string SettingsErrorMessage = "";
@@ -303,6 +324,26 @@ namespace SysDVR.Client.GUI
 				ImGui.TextWrapped(Strings.PerformanceRenderingLabel);
 				ImGui.Checkbox(Strings.UncapStreaming, ref Program.Options.UncapStreaming);
 				ImGui.Checkbox(Strings.UncapGUI, ref Program.Options.UncapGUI);
+
+				if (Program.IsWindows)
+				{
+					ImGui.NewLine();
+					bool rtxEnabled = Program.Options.Windows_RtxVideo.Enabled;
+					if (ImGui.Checkbox(Strings.RtxVideoExperimental, ref rtxEnabled))
+					{
+						Program.Options.Windows_RtxVideo.Enabled = rtxEnabled;
+						if (rtxEnabled)
+							RtxVideoSupport.ProbeFromSettings();
+					}
+					if (Program.Options.Windows_RtxVideo.Enabled)
+					{
+						RtxVideoOutputResolutions.Draw(
+							ref Program.Options.Windows_RtxVideo.OutputResolution);
+						RtxVideoQualities.Draw(ref Program.Options.Windows_RtxVideo.Quality);
+						ImGui.TextWrapped(Strings.RtxVideoOutput);
+						ImGui.TextWrapped(string.Format(Strings.RtxVideoStatus, RtxVideoSupport.Status));
+					}
+				}
 
 				ImGui.NewLine();
 				ImGui.TextWrapped(Strings.PerformanceStreamingLabel);
